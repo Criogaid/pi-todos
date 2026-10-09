@@ -38,7 +38,3 @@ export function makeMessageEntry(message: Message): SessionEntry {
 export function buildSessionEntries(messages: Message[]): SessionEntry[] {
 	return messages.map(makeMessageEntry);
 }
-
-export function makeTodoToolResult(details: unknown, text = "ok"): ToolResultMessage {
-	return makeToolResult({ toolName: "todo", text, details });
-}

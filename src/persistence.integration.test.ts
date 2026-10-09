@@ -1,295 +1,305 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { JsonObject } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-// Exercise the pinned dev host's actual execution pipeline and bounded recorder.
+// These integration tests exercise the actual pinned host pipeline, not just execute().
 import {
 	NESTED_CALL_LIMITS,
 	NestedToolCallRunner,
 } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/nested-tool-calls.js";
 import { wrapToolDefinition } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/tool-definition-wrapper.js";
 import { runToolCall } from "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js";
-import { createMockCtx, createMockPi, makeToolResult, makeUserMessage } from "../test/helpers/index.js";
+import {
+	createMockCtx,
+	createMockPi,
+	makeAssistantMessage,
+	makeToolResult,
+	makeUserMessage,
+} from "../test/helpers/index.js";
 import registerExtension from "./index.js";
-import { MAX_TODOS, type Todo } from "./model.js";
-import { getTodos } from "./store.js";
+import { isRecord } from "./model.js";
+import { TASKS_SNAPSHOT_TYPE } from "./persistence.js";
+import { getTaskState } from "./store.js";
 
-const assistantMessage: AssistantMessage = {
-	role: "assistant",
-	content: [],
-	api: "openai-completions",
-	provider: "openai",
-	model: "unused",
-	usage: {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	},
-	stopReason: "toolUse",
-	timestamp: 0,
-};
-const oldTodos: Todo[] = [{ content: "Old work", status: "pending" }];
-const done: Todo[] = [{ content: "Finished", status: "completed" }];
-const testDirectories: string[] = [];
-
+const directories: string[] = [];
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => {
 	vi.clearAllTimers();
 	vi.useRealTimers();
-	for (const directory of testDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+	for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
-async function setup(persistenceError?: Error) {
-	const directory = mkdtempSync(join(tmpdir(), "pi-todos-replay-"));
-	testDirectories.push(directory);
+async function setup() {
+	const directory = mkdtempSync(join(tmpdir(), "pi-task-replay-"));
+	directories.push(directory);
 	let manager = SessionManager.create(process.cwd(), directory);
 	manager.appendMessage(makeUserMessage("Track work"));
-	const initialId = manager.appendMessage(makeToolResult({ toolName: "todo", details: { todos: oldTodos } }));
 	const ctx = () => ({ ...createMockCtx(), sessionManager: manager });
-	const register = () => {
+	function register() {
 		const registration = createMockPi({
-			appendEntry: (customType, data) => {
-				if (persistenceError) throw persistenceError;
-				manager.appendCustomEntry(customType, data);
+			appendEntry: (type, data) => {
+				manager.appendCustomEntry(type, data);
 			},
 		});
 		registerExtension(registration.pi);
 		return registration;
-	};
+	}
 	let registration = register();
 	async function emit(name: string, event: unknown) {
 		for (const handler of registration.captured.events.get(name) ?? []) await handler(event, ctx());
 	}
 	await emit("session_start", {});
-
-	let nextDirect = 0;
-	async function executeDirect(todos: Todo[]) {
-		const definition = registration.captured.tools.get("todo");
-		if (!definition) throw new Error("todo tool not registered");
-		const toolCallId = `direct-${++nextDirect}`;
-		const result = await definition.execute(toolCallId, { todos }, undefined, undefined, ctx());
-		await emit("tool_execution_end", { toolCallId, toolName: "todo", result, isError: false });
-		manager.appendMessage(makeToolResult({ toolCallId, toolName: "todo", details: result.details }));
+	const tools = () =>
+		Array.from(registration.captured.tools.values(), (definition) => wrapToolDefinition(definition, ctx));
+	function run(
+		call: Parameters<typeof runToolCall>[0],
+		signal?: AbortSignal,
+		onUpdate?: Parameters<typeof runToolCall>[1]["onUpdate"],
+	) {
+		const available = tools();
+		return runToolCall(call, {
+			tools: available,
+			assistantMessage: makeAssistantMessage(),
+			context: { messages: [], tools: available },
+			signal,
+			onUpdate,
+		});
 	}
-
-	let nextWrapper = 0;
-	async function executeWrapper(inputs: readonly unknown[], wrapperError = false) {
-		const wrapperId = `wrapper-${++nextWrapper}`;
-		manager.appendMessage(assistantMessage);
-		const definition = registration.captured.tools.get("todo");
-		if (!definition) throw new Error("todo tool not registered");
-		const wrapped = wrapToolDefinition(definition, ctx);
+	let nextCall = 0;
+	async function call(name: string, args: JsonObject = {}) {
+		const id = `direct-${++nextCall}`;
+		manager.appendMessage(makeAssistantMessage([name]));
+		const outcome = await run({ type: "toolCall", id, name, arguments: args });
+		await emit("tool_execution_end", {
+			toolName: name,
+			toolCallId: id,
+			result: outcome.result,
+			isError: outcome.isError,
+		});
+		manager.appendMessage(
+			makeToolResult({ toolName: name, toolCallId: id, isError: outcome.isError, details: outcome.result.details }),
+		);
+		return outcome;
+	}
+	async function nested(calls: readonly { name: string; args: unknown }[], concurrent = false, wrapperError = false) {
+		const id = `wrapper-${++nextCall}`;
+		manager.appendMessage(makeAssistantMessage(["codemode"]));
 		const runner = new NestedToolCallRunner({
-			getTools: () => [wrapped],
+			getTools: tools,
 			isSequential: () => false,
 			emit: async (event) => {
 				await emit(event.type, event);
 			},
-			runToolCall: (call, _parent, signal, onUpdate) =>
-				runToolCall(call, {
-					tools: [wrapped],
-					assistantMessage,
-					context: { messages: [], tools: [wrapped] },
-					signal,
-					onUpdate,
-				}),
+			runToolCall: (toolCall, _parent, signal, onUpdate) => run(toolCall, signal, onUpdate),
 		});
 		const outcomes = [];
-		for (const input of inputs) outcomes.push(await runner.execute(wrapperId, "todo", input));
-		const nestedCalls = runner.takeRecord(wrapperId)?.calls;
+		if (concurrent)
+			outcomes.push(...(await Promise.all(calls.map(({ name, args }) => runner.execute(id, name, args)))));
+		else for (const { name, args } of calls) outcomes.push(await runner.execute(id, name, args));
+		const nestedCalls = runner.takeRecord(id)?.calls;
 		manager.appendMessage(
-			makeToolResult({ toolName: "codemode", toolCallId: wrapperId, isError: wrapperError, nestedCalls }),
+			makeToolResult({ toolName: "codemode", toolCallId: id, isError: wrapperError, nestedCalls }),
 		);
 		return { outcomes, nestedCalls };
 	}
 	async function reload() {
 		const file = manager.getSessionFile();
-		if (!file) throw new Error("session was not persisted");
+		if (!file) throw new Error("session not persisted");
 		await emit("session_shutdown", {});
 		manager = SessionManager.open(file, directory);
 		registration = register();
 		await emit("session_start", {});
-		return getTodos(manager.getSessionId());
+		return state();
 	}
-	function expectLive(expected: readonly Todo[]) {
-		expect(getTodos(manager.getSessionId())).toEqual(expected);
-	}
+	const state = () => getTaskState(manager.getSessionId());
 	return {
-		executeWrapper,
-		executeDirect,
+		call,
+		nested,
 		reload,
-		expectLive,
-		initialId,
-		branch: (id: string) => manager.branch(id),
+		state,
 		emit,
+		manager: () => manager,
+		snapshotCount: () =>
+			manager.getEntries().filter((entry) => entry.type === "custom" && entry.customType === TASKS_SNAPSHOT_TYPE)
+				.length,
 	};
 }
-
-interface InputCase {
-	name: string;
-	input: unknown;
-	expected: Todo[];
+function createdId(outcome: Awaited<ReturnType<typeof runToolCall>>): string {
+	expect(outcome.isError).toBe(false);
+	const output = outcome.result.structuredContent;
+	if (!isRecord(output) || !isRecord(output.task) || typeof output.task.id !== "string")
+		throw new Error("missing structured task id");
+	return output.task.id;
 }
-const inputCases: InputCase[] = [
-	{ name: "normal strings", input: { todos: done }, expected: done },
-	{
-		name: "numeric content",
-		input: { todos: [{ content: 42, status: "completed" }] },
-		expected: [{ content: "42", status: "completed" }],
-	},
-	{
-		name: "boolean content",
-		input: { todos: [{ content: false, status: "completed" }] },
-		expected: [{ content: "false", status: "completed" }],
-	},
-	{
-		name: "numeric activeForm",
-		input: { todos: [{ content: "Task", status: "in_progress", activeForm: 2 }] },
-		expected: [{ content: "Task", status: "in_progress", activeForm: "2" }],
-	},
-	{
-		name: "object container",
-		input: { todos: { content: "Task", status: "completed" } },
-		expected: [{ content: "Task", status: "completed" }],
-	},
-	{
-		name: "trimmed fields",
-		input: { todos: [{ content: " Task ", status: "in_progress", activeForm: " Working " }] },
-		expected: [{ content: "Task", status: "in_progress", activeForm: "Working" }],
-	},
-	{
-		name: "blank activeForm",
-		input: { todos: [{ content: "Task", status: "completed", activeForm: "   " }] },
-		expected: [{ content: "Task", status: "completed" }],
-	},
-];
 
-describe("nested todo persistence through the Pi host", () => {
-	it.each(inputCases)("restores the executed snapshot after disk reload: $name", async ({ input, expected }) => {
+describe("task persistence through the real Pi host", () => {
+	it("creates, repairs and updates direct calls before restoring tasks from disk", async () => {
 		const harness = await setup();
-		const { outcomes } = await harness.executeWrapper([input]);
-		expect(outcomes[0].isError).toBe(false);
-		harness.expectLive(expected);
-		expect(await harness.reload()).toEqual(expected);
+		const id = createdId(
+			await harness.call("TaskCreate", {
+				subject: "  Build  ",
+				description: "Details",
+				active_form: "Building",
+				metadata: { keep: true, removed: null },
+			}),
+		);
+		const update = await harness.call("TaskUpdate", { task_id: ` #${id} `, status: "in_progress", owner: "agent" });
+		expect(update.isError).toBe(false);
+		expect(update.result.structuredContent).toMatchObject({
+			success: true,
+			taskId: id,
+			updatedFields: ["owner", "status"],
+		});
+		const get = await harness.call("TaskGet", { id: Number(id) });
+		expect(get.isError).toBe(false);
+		expect(get.result.structuredContent).toMatchObject({ task: { id, subject: "  Build  ", status: "in_progress" } });
+		const before = structuredClone(harness.state());
+		expect(before.tasks[0]).toMatchObject({ activeForm: "Building", metadata: { keep: true }, owner: "agent" });
+		expect(await harness.reload()).toEqual(before);
 	});
 
-	it("restores a valid list when the host omits oversized arguments", async () => {
+	it("runs TaskCreate and TaskUpdate as codemode subcalls with structured results", async () => {
 		const harness = await setup();
-		const contentBytes = Math.ceil(NESTED_CALL_LIMITS.maxArgumentBytesPerCall / MAX_TODOS);
-		const todos: Todo[] = Array.from({ length: MAX_TODOS }, (_, index) => ({
-			content: `Task ${index}: ${"x".repeat(contentBytes)}`,
-			status: "completed",
-		}));
-		const { outcomes, nestedCalls } = await harness.executeWrapper([{ todos }]);
-		expect(outcomes[0].isError).toBe(false);
-		expect(nestedCalls?.calls[0]?.arguments).toBeUndefined();
-		harness.expectLive(todos);
-		const restored = await harness.reload();
-		expect(restored).toHaveLength(todos.length);
-		expect(restored).toEqual(todos);
+		const create = await harness.nested([
+			{ name: "TaskCreate", args: { subject: "Nested task", description: "Details" } },
+		]);
+		const id = createdId(create.outcomes[0]);
+		const update = await harness.nested([
+			{ name: "TaskUpdate", args: { id: Number(id), status: "completed" } },
+			{ name: "TaskGet", args: { taskId: `#${id}` } },
+			{ name: "TaskList", args: {} },
+		]);
+		expect(update.outcomes.every((outcome) => !outcome.isError)).toBe(true);
+		expect(update.outcomes[0].result.structuredContent).toMatchObject({
+			success: true,
+			taskId: id,
+			statusChange: { from: "pending", to: "completed" },
+		});
+		expect(harness.snapshotCount()).toBe(2);
+		const before = structuredClone(harness.state());
+		expect(await harness.reload()).toEqual(before);
 	});
 
-	it("restores the final update when earlier calls exhaust the total argument budget", async () => {
+	it("preserves tasks when the host omits oversized nested arguments", async () => {
 		const harness = await setup();
-		const contentBytes = Math.floor(NESTED_CALL_LIMITS.maxArgumentBytesPerCall / 2);
-		const repeats = Math.ceil(NESTED_CALL_LIMITS.maxArgumentBytesTotal / contentBytes);
-		const input = { todos: [{ content: "x".repeat(contentBytes), status: "pending" }] };
-		const finalTodos: Todo[] = [{ content: "x".repeat(contentBytes), status: "completed" }];
-		const { outcomes, nestedCalls } = await harness.executeWrapper([
-			...Array.from({ length: repeats }, () => input),
-			{ todos: finalTodos },
+		const description = "x".repeat(NESTED_CALL_LIMITS.maxArgumentBytesPerCall + 1);
+		const { outcomes, nestedCalls } = await harness.nested([
+			{ name: "TaskCreate", args: { subject: "Large description", description } },
+			{ name: "TaskUpdate", args: { taskId: "1", status: "completed" } },
 		]);
 		expect(outcomes.every((outcome) => !outcome.isError)).toBe(true);
-		expect(nestedCalls?.calls.at(-1)?.arguments).toBeUndefined();
-		harness.expectLive(finalTodos);
-		expect((await harness.reload()).map((todo) => todo.status)).toEqual(["completed"]);
+		expect(nestedCalls?.calls[0]?.arguments).toBeUndefined();
+		const restored = await harness.reload();
+		expect(restored.highWaterMark).toBe(1);
+		expect(restored.tasks[0]).toMatchObject({ description, status: "completed" });
 	});
 
-	it("restores the final update when the host drops calls beyond its count limit", async () => {
+	it("preserves updates dropped from the host's nested-call record", async () => {
 		const harness = await setup();
-		const inputs = [
-			...Array.from({ length: NESTED_CALL_LIMITS.maxCalls }, () => ({ todos: oldTodos })),
-			{ todos: done },
-		];
-		const { outcomes, nestedCalls } = await harness.executeWrapper(inputs);
+		const calls = Array.from({ length: NESTED_CALL_LIMITS.maxCalls + 1 }, (_, index) => ({
+			name: "TaskCreate",
+			args: { subject: `Task ${index}`, description: "" },
+		}));
+		const { outcomes, nestedCalls } = await harness.nested(calls);
 		expect(outcomes.every((outcome) => !outcome.isError)).toBe(true);
 		expect(nestedCalls?.calls.length).toBeLessThan(outcomes.length);
-		harness.expectLive(done);
-		expect(await harness.reload()).toEqual(done);
+		const restored = await harness.reload();
+		expect(restored.tasks).toHaveLength(calls.length);
+		expect(restored.highWaterMark).toBe(calls.length);
 	});
 
-	it("keeps a successful nested update when its wrapper later fails", async () => {
+	it("allocates unique ids for concurrent nested creates", async () => {
 		const harness = await setup();
-		await harness.executeWrapper([{ todos: done }], true);
-		harness.expectLive(done);
-		expect(await harness.reload()).toEqual(done);
+		const { outcomes } = await harness.nested(
+			["First", "Second", "Third", "Fourth"].map((subject) => ({
+				name: "TaskCreate",
+				args: { subject, description: "" },
+			})),
+			true,
+		);
+		const ids = outcomes.map(createdId);
+		expect(new Set(ids).size).toBe(4);
+		expect(harness.state().highWaterMark).toBe(4);
+		expect((await harness.reload()).tasks.map((task) => task.id)).toEqual(ids);
 	});
 
-	it("does not persist a rejected replacement over a successful update", async () => {
+	it("does not write snapshots for reads, missing updates or invalid arguments", async () => {
 		const harness = await setup();
-		const { outcomes } = await harness.executeWrapper([
-			{ todos: done },
-			{ todos: [{ content: " ", status: "pending" }] },
-		]);
-		expect(outcomes.map((outcome) => outcome.isError)).toEqual([false, true]);
-		harness.expectLive(done);
-		expect(await harness.reload()).toEqual(done);
+		await harness.call("TaskCreate", { subject: "Task", description: "" });
+		const before = structuredClone(harness.state());
+		await harness.call("TaskGet", { taskId: "1" });
+		await harness.call("TaskList");
+		const missing = await harness.call("TaskUpdate", { taskId: "99", status: "completed" });
+		expect(missing.isError).toBe(false);
+		expect(missing.result.structuredContent).toMatchObject({ success: false, error: "Task not found" });
+		const invalid = await harness.call("TaskUpdate", { taskId: "1", status: "invalid" });
+		expect(invalid.isError).toBe(true);
+		expect(harness.snapshotCount()).toBe(1);
+		expect(await harness.reload()).toEqual(before);
 	});
 
-	it("restores only the selected branch during navigation and compaction", async () => {
+	it("keeps a successful nested write if the wrapper subsequently fails", async () => {
 		const harness = await setup();
-		const completedId = await harness.executeWrapper([{ todos: done }]);
-		expect(completedId.outcomes[0].isError).toBe(false);
-		harness.branch(harness.initialId);
+		const { outcomes } = await harness.nested(
+			[{ name: "TaskCreate", args: { subject: "Saved", description: "" } }],
+			false,
+			true,
+		);
+		createdId(outcomes[0]);
+		expect((await harness.reload()).tasks[0].subject).toBe("Saved");
+	});
+
+	it("restores deletion cleanup and retains the high-water mark after reload", async () => {
+		const harness = await setup();
+		await harness.call("TaskCreate", { subject: "First", description: "" });
+		await harness.call("TaskCreate", { subject: "Second", description: "" });
+		await harness.call("TaskUpdate", { taskId: "1", addBlocks: [2] });
+		await harness.call("TaskUpdate", { taskId: "1", status: "deleted" });
+		const restored = await harness.reload();
+		expect(restored.tasks.map((task) => task.id)).toEqual(["2"]);
+		expect(restored.tasks[0].blockedBy).toEqual([]);
+		expect(restored.highWaterMark).toBe(2);
+		expect(createdId(await harness.call("TaskCreate", { subject: "Third", description: "" }))).toBe("3");
+	});
+
+	it("persists automatic clearing without reusing completed task ids", async () => {
+		const harness = await setup();
+		await harness.call("TaskCreate", { subject: "First", description: "" });
+		await harness.call("TaskUpdate", { taskId: "1", status: "completed" });
+		await harness.emit("agent_start", {});
+		const cleared = await harness.reload();
+		expect(cleared.tasks).toEqual([]);
+		expect(cleared.highWaterMark).toBe(1);
+		expect(createdId(await harness.call("TaskCreate", { subject: "Next", description: "" }))).toBe("2");
+	});
+
+	it("restores the selected branch and survives a real compaction entry", async () => {
+		const harness = await setup();
+		await harness.call("TaskCreate", { subject: "First", description: "" });
+		const firstLeaf = harness.manager().getLeafId();
+		if (!firstLeaf) throw new Error("missing branch point");
+		await harness.call("TaskCreate", { subject: "Abandoned", description: "" });
+		harness.manager().branch(firstLeaf);
 		await harness.emit("session_tree", {});
-		harness.expectLive(oldTodos);
-		await harness.executeWrapper([{ todos: [] }]);
+		expect(harness.state().tasks.map((task) => task.subject)).toEqual(["First"]);
+		expect(harness.state().highWaterMark).toBe(1);
+		await harness.call("TaskCreate", { subject: "New branch", description: "" });
+		const before = structuredClone(harness.state());
+		harness.manager().appendCompaction("Summary", harness.manager().getLeafId(), 100);
 		await harness.emit("session_compact", {});
-		harness.expectLive([]);
-		expect(await harness.reload()).toEqual([]);
-	});
-});
-
-describe("snapshot write boundaries", () => {
-	it("leaves the live and saved list untouched when persistence fails", async () => {
-		const harness = await setup(new Error("Session storage unavailable"));
-		const { outcomes } = await harness.executeWrapper([{ todos: done }]);
-		expect(outcomes[0].isError).toBe(true);
-		harness.expectLive(oldTodos);
-		expect(await harness.reload()).toEqual(oldTodos);
+		expect(harness.state()).toEqual(before);
+		expect(await harness.reload()).toEqual(before);
 	});
 
-	it("restores a direct update after a nested update", async () => {
-		const harness = await setup();
-		await harness.executeWrapper([{ todos: done }]);
-		await harness.executeDirect(oldTodos);
-		harness.expectLive(oldTodos);
-		expect(await harness.reload()).toEqual(oldTodos);
-	});
-
-	it("restores a nested clear after a direct update", async () => {
-		const harness = await setup();
-		await harness.executeDirect(done);
-		await harness.executeWrapper([{ todos: [] }]);
-		harness.expectLive([]);
-		expect(await harness.reload()).toEqual([]);
-	});
-
-	it("keeps persisted snapshots isolated between sessions", async () => {
+	it("keeps disk snapshots isolated across two sessions", async () => {
 		const first = await setup();
 		const second = await setup();
-		await first.executeWrapper([{ todos: done }]);
-		await second.executeWrapper([{ todos: [] }]);
-		first.expectLive(done);
-		second.expectLive([]);
-		expect(await first.reload()).toEqual(done);
-		second.expectLive([]);
-		expect(await second.reload()).toEqual([]);
-		first.expectLive(done);
+		await first.call("TaskCreate", { subject: "First session", description: "" });
+		await second.call("TaskCreate", { subject: "Second session", description: "" });
+		expect((await first.reload()).tasks[0].subject).toBe("First session");
+		expect((await second.reload()).tasks[0].subject).toBe("Second session");
+		expect(first.state().tasks[0].subject).toBe("First session");
 	});
 });

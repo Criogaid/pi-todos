@@ -1,35 +1,31 @@
 import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-	buildSessionEntries,
 	createMockCtx,
 	createMockPi,
-	makeTodoToolResult,
-	makeToolResult,
+	makeAssistantMessage,
+	makeMessageEntry,
+	makeSnapshotEntry,
+	makeState,
+	makeTask,
 	makeUserMessage,
 } from "../test/helpers/index.js";
 import * as config from "./config.js";
 import registerExtension, { PREWARM_DELAY_MS } from "./index.js";
-import { isRecord, type Todo } from "./model.js";
+import { isRecord, type TaskState } from "./model.js";
 import * as overlayModule from "./overlay.js";
-import { getForeground, getForegroundTodos, getTodos, setTodos } from "./store.js";
+import { decodeSnapshot } from "./persistence.js";
+import { REMINDER_MESSAGE_TYPE, REMINDER_TEXT } from "./reminder.js";
+import { getForeground, getForegroundState, getTaskState, setTaskState } from "./store.js";
 
-const pending = (content: string): Todo => ({ content, status: "pending" });
-const completed = (content: string): Todo => ({ content, status: "completed" });
-function branch(todos: Todo[]) {
-	return buildSessionEntries([makeTodoToolResult({ todos })]);
-}
-
+const pending = () => makeState([makeTask()]);
+const branch = (state: TaskState) => [makeSnapshotEntry(state)];
 function setup(importer = vi.fn(async () => overlayModule)) {
 	const { pi, captured } = createMockPi();
 	registerExtension(pi, importer);
-	const tool = captured.tools.get("todo");
-	if (!tool) throw new Error("todo tool not registered");
 	async function emit(name: string, event: unknown, ctx: ExtensionToolContext) {
-		const handlers = captured.events.get(name);
-		if (!handlers?.length) throw new Error(`missing event handler: ${name}`);
 		const results: unknown[] = [];
-		for (const handler of handlers) results.push(await handler(event, ctx));
+		for (const handler of captured.events.get(name) ?? []) results.push(await handler(event, ctx));
 		return results;
 	}
 	async function context(ctx: ExtensionToolContext) {
@@ -40,91 +36,72 @@ function setup(importer = vi.fn(async () => overlayModule)) {
 		expect(result.messages[0]).toEqual(original[0]);
 		return result.messages.filter((message) => isRecord(message) && message.customType === "pi-todos-resume");
 	}
-	const write = async (todos: Todo[], ctx: ExtensionToolContext) => {
-		const result = await tool.execute("call", { todos }, undefined, undefined, ctx);
-		await emit("tool_execution_end", { toolName: "todo", result, isError: false }, ctx);
-	};
-	return { captured, importer, emit, context, write };
+	async function write(name: string, args: unknown, ctx: ExtensionToolContext) {
+		const tool = captured.tools.get(name);
+		if (!tool) throw new Error("tool not registered");
+		const result = await tool.execute(`call-${name}`, args, undefined, undefined, ctx);
+		await emit("tool_execution_end", { toolName: name, result, isError: false }, ctx);
+		return result;
+	}
+	return { pi, captured, importer, emit, context, write };
 }
-
 beforeEach(() => vi.useFakeTimers());
 afterEach(() => {
 	vi.clearAllTimers();
 	vi.useRealTimers();
 });
 
-describe("session lifecycle and foreground ownership", () => {
-	it("keeps child and headless sessions isolated from the first UI session", async () => {
+describe("session restoration and ownership", () => {
+	it("keeps foreground, child and headless task states isolated", async () => {
 		const lifecycle = setup();
-		const headless = createMockCtx({ sessionId: "headless", branch: branch([pending("Headless")]) });
-		const parent = createMockCtx({ sessionId: "parent", hasUI: true, branch: branch([pending("Parent")]) });
-		const child = createMockCtx({ sessionId: "child", hasUI: true, branch: branch([pending("Child")]) });
+		const headless = createMockCtx({ sessionId: "headless", branch: branch(pending()) });
+		const parent = createMockCtx({ sessionId: "parent", hasUI: true, branch: branch(pending()) });
+		const child = createMockCtx({ sessionId: "child", hasUI: true, branch: branch(makeState([makeTask("5")])) });
 		await lifecycle.emit("session_start", {}, headless);
 		expect(getForeground()).toBeUndefined();
 		await lifecycle.emit("session_start", {}, parent);
 		await lifecycle.emit("session_start", {}, child);
 		expect(getForeground()).toBe("parent");
-		expect(getForegroundTodos()).toEqual([pending("Parent")]);
+		expect(getForegroundState()).toEqual(pending());
 		expect(child.ui.setWidget).not.toHaveBeenCalled();
-		await lifecycle.write([pending("Child changed")], child);
-		expect(getTodos("child")).toEqual([pending("Child changed")]);
-		expect(getForegroundTodos()).toEqual([pending("Parent")]);
+		await lifecycle.write("TaskCreate", { subject: "Child work", description: "" }, child);
+		expect(getTaskState("child").highWaterMark).toBe(6);
+		expect(getForegroundState()).toEqual(pending());
 		await lifecycle.emit("session_shutdown", {}, child);
-		expect(getTodos("child")).toEqual([]);
+		expect(getTaskState("child").tasks).toEqual([]);
 		expect(getForeground()).toBe("parent");
-		expect(parent.ui.setWidget).toHaveBeenCalledTimes(1);
 		await lifecycle.emit("session_shutdown", {}, parent);
 		expect(getForeground()).toBeUndefined();
-		expect(getTodos("parent")).toEqual([]);
+		expect(getTaskState("parent").tasks).toEqual([]);
 		expect(parent.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
 	});
 
-	it("replays branch changes during compaction and tree navigation", async () => {
+	it("replays only the current branch during compaction and tree navigation", async () => {
 		const lifecycle = setup();
-		const ctx = createMockCtx({ sessionId: "main", hasUI: true, branch: branch([pending("Initial")]) });
+		const ctx = createMockCtx({ sessionId: "main", hasUI: true, branch: branch(pending()) });
 		await lifecycle.emit("session_start", {}, ctx);
-		vi.mocked(ctx.sessionManager.getBranch).mockReturnValue(branch([pending("Compacted")]));
+		const compacted = makeState([makeTask("5")], 9);
+		vi.mocked(ctx.sessionManager.getBranch).mockReturnValue(branch(compacted));
 		await lifecycle.emit("session_compact", {}, ctx);
-		expect(getTodos("main")).toEqual([pending("Compacted")]);
-		vi.mocked(ctx.sessionManager.getBranch).mockReturnValue(branch([]));
+		expect(getTaskState("main")).toEqual(compacted);
+		vi.mocked(ctx.sessionManager.getBranch).mockReturnValue(branch(makeState([], 9)));
 		await lifecycle.emit("session_tree", {}, ctx);
-		expect(getTodos("main")).toEqual([]);
+		expect(getTaskState("main")).toEqual(makeState([], 9));
 		expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
 	});
 
-	it("recovers state from wrapper tools like codemode after session reload", async () => {
+	it("restores the same tasks and counter when reloaded", async () => {
 		const lifecycle = setup();
-		const nestedBranch = [
-			makeTodoToolResult({ todos: [pending("Initial direct")] }),
-			makeToolResult({
-				toolName: "codemode",
-				text: "done",
-				nestedCalls: {
-					complete: true,
-					calls: [{ name: "todo", status: "ok", arguments: { todos: [completed("Finished via codemode")] } }],
-				},
-			}),
-		];
-		const ctx = createMockCtx({ sessionId: "main", hasUI: true, branch: buildSessionEntries(nestedBranch) });
+		const state = makeState([makeTask("3", { owner: "agent" })], 7);
+		const ctx = createMockCtx({ sessionId: "main", branch: branch(state) });
 		await lifecycle.emit("session_start", {}, ctx);
-		expect(getForegroundTodos()).toEqual([completed("Finished via codemode")]);
+		await lifecycle.emit("session_shutdown", {}, ctx);
+		const reloaded = setup();
+		await reloaded.emit("session_start", {}, ctx);
+		expect(getTaskState("main")).toEqual(state);
 	});
 
-	it("dismisses finished foreground work on agent_start and shows a different list", async () => {
-		const lifecycle = setup();
-		const ctx = createMockCtx({ sessionId: "main", hasUI: true, branch: branch([completed("Done")]) });
-		await lifecycle.emit("session_start", {}, ctx);
-		await lifecycle.emit("agent_start", {}, createMockCtx({ sessionId: "child" }));
-		expect(ctx.ui.setWidget).toHaveBeenCalledTimes(1);
-		await lifecycle.emit("agent_start", {}, ctx);
-		expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
-		await lifecycle.write([completed("Done")], ctx);
-		expect(ctx.ui.setWidget).toHaveBeenCalledTimes(2);
-		await lifecycle.write([pending("New")], ctx);
-		expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", expect.any(Function), { placement: "aboveEditor" });
-	});
-
-	it("binds the configured collapse shortcut and skips registration when disabled", () => {
+	it("binds the configured shortcut and skips registration when disabled", () => {
 		const defaults = config.loadSettings();
 		vi.spyOn(config, "loadSettings").mockReturnValue({ ...defaults, collapseKey: "alt+o" });
 		expect([...setup().captured.shortcuts.keys()]).toEqual(["alt+o"]);
@@ -132,33 +109,79 @@ describe("session lifecycle and foreground ownership", () => {
 		expect(setup().captured.shortcuts.size).toBe(0);
 	});
 
-	it("disposes the foreground when shutdown arrives through a stale context", async () => {
+	it("disposes the foreground when shutdown receives a stale context", async () => {
 		const lifecycle = setup();
-		const ctx = createMockCtx({ sessionId: "main", hasUI: true, branch: branch([pending("Work")]) });
+		const ctx = createMockCtx({ hasUI: true, branch: branch(pending()) });
 		await lifecycle.emit("session_start", {}, ctx);
 		const stale = createMockCtx();
 		vi.mocked(stale.sessionManager.getSessionId).mockImplementation(() => {
-			throw new Error("context stale after session replacement");
+			throw new Error("This extension ctx is stale after session replacement or reload.");
 		});
 		await lifecycle.emit("session_shutdown", {}, stale);
 		expect(getForeground()).toBeUndefined();
-		expect(getTodos("main")).toEqual([]);
 		expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
+	});
+});
+
+describe("finished-list clearing", () => {
+	it("saves a clear without a tool-call marker, removes the widget and retains the counter", async () => {
+		const lifecycle = setup();
+		const finished = makeState(
+			[makeTask("1", { status: "completed" }), makeTask("2", { metadata: { _internal: true } })],
+			8,
+		);
+		const ctx = createMockCtx({ hasUI: true, branch: branch(finished) });
+		await lifecycle.emit("session_start", {}, ctx);
+		await lifecycle.emit("agent_start", {}, ctx);
+		expect(getTaskState("test-session")).toEqual(makeState([], 8));
+		const data = vi.mocked(lifecycle.pi.appendEntry).mock.calls[0][1];
+		expect(decodeSnapshot(data)).toEqual(makeState([], 8));
+		expect(data).not.toHaveProperty("toolCallId");
+		expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
+		const created = await lifecycle.write("TaskCreate", { subject: "New work", description: "" }, ctx);
+		expect(created.details).toMatchObject({ task: { id: "9" } });
+		expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", expect.any(Function), { placement: "aboveEditor" });
+	});
+
+	it.each([makeState(), pending(), makeState([makeTask("1", { metadata: { _internal: true } })])])(
+		"does not clear unfinished, empty or internal-only state: %j",
+		async (state) => {
+			const lifecycle = setup();
+			const ctx = createMockCtx({ branch: branch(state) });
+			await lifecycle.emit("session_start", {}, ctx);
+			await lifecycle.emit("agent_start", {}, ctx);
+			expect(lifecycle.pi.appendEntry).not.toHaveBeenCalled();
+			expect(getTaskState("test-session")).toEqual(state);
+		},
+	);
+
+	it("clears a finished child without replacing foreground state", async () => {
+		const lifecycle = setup();
+		const parent = createMockCtx({ sessionId: "parent", hasUI: true, branch: branch(pending()) });
+		const child = createMockCtx({
+			sessionId: "child",
+			branch: branch(makeState([makeTask("5", { status: "completed" })])),
+		});
+		await lifecycle.emit("session_start", {}, parent);
+		await lifecycle.emit("session_start", {}, child);
+		await lifecycle.emit("agent_start", {}, child);
+		expect(getTaskState("child")).toEqual(makeState([], 5));
+		expect(getForegroundState()).toEqual(pending());
 	});
 });
 
 describe("resume injection", () => {
 	it.each(["error", "aborted"])(
-		"retries after %s and stops only after a successful assistant response",
+		"retries after %s and acknowledges only a successful assistant",
 		async (stopReason) => {
 			const lifecycle = setup();
-			const ctx = createMockCtx({ sessionId: "main", branch: branch([pending("Saved")]) });
+			const ctx = createMockCtx({ branch: branch(pending()) });
 			await lifecycle.emit("session_start", {}, ctx);
 			expect(await lifecycle.context(ctx)).toEqual([
 				expect.objectContaining({
 					customType: "pi-todos-resume",
 					display: false,
-					content: expect.stringContaining("Saved"),
+					content: expect.stringContaining("Task 1"),
 				}),
 			]);
 			await lifecycle.emit("message_end", { message: { role: "assistant", stopReason } }, ctx);
@@ -170,9 +193,9 @@ describe("resume injection", () => {
 		},
 	);
 
-	it("does not let an old response acknowledge a new branch generation", async () => {
+	it("does not let an old response acknowledge a newer restoration", async () => {
 		const lifecycle = setup();
-		const ctx = createMockCtx({ branch: branch([pending("Saved")]) });
+		const ctx = createMockCtx({ branch: branch(pending()) });
 		await lifecycle.emit("session_start", {}, ctx);
 		await lifecycle.context(ctx);
 		await lifecycle.emit("session_compact", {}, ctx);
@@ -182,36 +205,78 @@ describe("resume injection", () => {
 		expect(await lifecycle.context(ctx)).toEqual([]);
 	});
 
-	it("acks each session independently and restores context after tree navigation", async () => {
+	it("tracks acknowledgements per session and marks tree navigation pending again", async () => {
 		const lifecycle = setup();
-		const a = createMockCtx({ sessionId: "a", branch: branch([pending("A")]) });
-		const b = createMockCtx({ sessionId: "b", branch: branch([pending("B")]) });
-		await lifecycle.emit("session_start", {}, a);
-		await lifecycle.emit("session_start", {}, b);
-		await lifecycle.context(a);
-		await lifecycle.context(b);
-		await lifecycle.emit("message_end", { message: { role: "assistant", stopReason: "toolUse" } }, b);
-		expect(await lifecycle.context(b)).toEqual([]);
-		expect(await lifecycle.context(a)).toHaveLength(1);
-		await lifecycle.emit("session_tree", {}, b);
-		expect(await lifecycle.context(b)).toHaveLength(1);
+		const first = createMockCtx({ sessionId: "first", branch: branch(pending()) });
+		const second = createMockCtx({ sessionId: "second", branch: branch(pending()) });
+		await lifecycle.emit("session_start", {}, first);
+		await lifecycle.emit("session_start", {}, second);
+		await lifecycle.context(second);
+		await lifecycle.emit("message_end", { message: { role: "assistant", stopReason: "toolUse" } }, second);
+		expect(await lifecycle.context(first)).toHaveLength(1);
+		expect(await lifecycle.context(second)).toEqual([]);
+		await lifecycle.emit("session_tree", {}, second);
+		expect(await lifecycle.context(second)).toHaveLength(1);
 	});
 
-	it("omits summaries for completed lists and when the setting is disabled", async () => {
+	it("omits completed summaries and honors the disabled setting", async () => {
 		const lifecycle = setup();
-		const ctx = createMockCtx({ branch: branch([completed("Done")]) });
-		await lifecycle.emit("session_start", {}, ctx);
-		expect(await lifecycle.context(ctx)).toEqual([]);
+		const completed = createMockCtx({ branch: branch(makeState([makeTask("1", { status: "completed" })])) });
+		await lifecycle.emit("session_start", {}, completed);
+		expect(await lifecycle.context(completed)).toEqual([]);
 		vi.spyOn(config, "loadSettings").mockReturnValue({ ...config.loadSettings(), resumeContext: false });
 		const disabled = setup();
-		const other = createMockCtx({ sessionId: "other", branch: branch([pending("Work")]) });
-		await disabled.emit("session_start", {}, other);
-		expect(await disabled.context(other)).toEqual([]);
+		const ctx = createMockCtx({ branch: branch(pending()) });
+		await disabled.emit("session_start", {}, ctx);
+		expect(await disabled.context(ctx)).toEqual([]);
 	});
 });
 
+describe("turn-end task reminder", () => {
+	const dueBranch = () => Array.from({ length: 10 }, () => makeMessageEntry(makeAssistantMessage()));
+	it("preserves earlier drafts and adds a hidden reminder when all gates hold", async () => {
+		const lifecycle = setup();
+		const ctx = createMockCtx({ branch: dueBranch() });
+		const draft = { type: "custom", customType: "earlier", data: { saved: true } };
+		const entries = [draft];
+		const [result] = await lifecycle.emit("turn_end", { outcome: "completed", entries }, ctx);
+		expect(result).toEqual({
+			entries: [
+				draft,
+				{ type: "custom_message", customType: REMINDER_MESSAGE_TYPE, content: REMINDER_TEXT, display: false },
+			],
+		});
+		expect(entries).toEqual([draft]);
+		if (!isRecord(result) || !Array.isArray(result.entries)) throw new Error("missing drafts");
+		expect(result.entries[0]).toBe(draft);
+	});
+
+	it.each(["disabled", "aborted", "error", "inactive", "not-due", "stale"])(
+		"does not remind when %s",
+		async (gate) => {
+			if (gate === "disabled")
+				vi.spyOn(config, "loadSettings").mockReturnValue({ ...config.loadSettings(), taskReminder: false });
+			const lifecycle = setup();
+			const ctx = createMockCtx({ branch: dueBranch() });
+			if (gate === "inactive") lifecycle.captured.activeTools = ["TaskGet", "TaskList", "TaskUpdate"];
+			if (gate === "not-due") vi.mocked(ctx.sessionManager.getBranch).mockReturnValue(dueBranch().slice(0, 9));
+			if (gate === "stale")
+				vi.mocked(ctx.sessionManager.getBranch).mockImplementation(() => {
+					throw new Error("This extension ctx is stale after session replacement or reload.");
+				});
+			expect(
+				await lifecycle.emit(
+					"turn_end",
+					{ outcome: gate === "aborted" || gate === "error" ? gate : "completed", entries: [] },
+					ctx,
+				),
+			).toEqual([undefined]);
+		},
+	);
+});
+
 describe("lazy overlay lifecycle", () => {
-	it("prewarms after startup without registering an empty widget", async () => {
+	it("prewarms without registering an empty widget", async () => {
 		const lifecycle = setup();
 		const ctx = createMockCtx({ hasUI: true });
 		await lifecycle.emit("session_start", {}, ctx);
@@ -221,8 +286,25 @@ describe("lazy overlay lifecycle", () => {
 		expect(ctx.ui.setWidget).not.toHaveBeenCalled();
 	});
 
-	it("ignores a delayed import for a session that shut down before it resolved", async () => {
-		let resolve!: (module: typeof overlayModule) => void;
+	it("refreshes only successful write tools", async () => {
+		const lifecycle = setup();
+		const ctx = createMockCtx({ hasUI: true, branch: branch(pending()) });
+		const updates = vi.spyOn(overlayModule.TodoOverlay.prototype, "update");
+		await lifecycle.emit("session_start", {}, ctx);
+		const initial = updates.mock.calls.length;
+		for (const toolName of ["TaskGet", "TaskList", "other"])
+			await lifecycle.emit("tool_execution_end", { toolName, isError: false }, ctx);
+		await lifecycle.emit("tool_execution_end", { toolName: "TaskUpdate", isError: true }, ctx);
+		expect(updates).toHaveBeenCalledTimes(initial);
+		for (const toolName of ["TaskCreate", "TaskUpdate"])
+			await lifecycle.emit("tool_execution_end", { toolName, isError: false }, ctx);
+		expect(updates).toHaveBeenCalledTimes(initial + 2);
+	});
+
+	it("ignores a delayed import after the original session shuts down", async () => {
+		let resolve: (module: typeof overlayModule) => void = () => {
+			throw new Error("promise not created");
+		};
 		const lifecycle = setup(
 			vi.fn(
 				() =>
@@ -233,10 +315,10 @@ describe("lazy overlay lifecycle", () => {
 		);
 		const old = createMockCtx({ sessionId: "old", hasUI: true });
 		await lifecycle.emit("session_start", {}, old);
-		setTodos("old", [pending("Old")]);
-		const oldRefresh = lifecycle.emit("tool_execution_end", { toolName: "todo", isError: false }, old);
+		setTaskState("old", pending());
+		const oldRefresh = lifecycle.emit("tool_execution_end", { toolName: "TaskCreate", isError: false }, old);
 		await lifecycle.emit("session_shutdown", {}, old);
-		const replacement = createMockCtx({ sessionId: "new", hasUI: true, branch: branch([pending("New")]) });
+		const replacement = createMockCtx({ sessionId: "new", hasUI: true, branch: branch(pending()) });
 		const replacementStart = lifecycle.emit("session_start", {}, replacement);
 		resolve(overlayModule);
 		await Promise.all([oldRefresh, replacementStart]);
@@ -245,7 +327,7 @@ describe("lazy overlay lifecycle", () => {
 		expect(getForeground()).toBe("new");
 	});
 
-	it("retries after a transient refresh failure and ignores failed or foreign tool events", async () => {
+	it("retries after a transient refresh failure", async () => {
 		const importer = vi
 			.fn<() => Promise<typeof overlayModule>>()
 			.mockRejectedValueOnce(new Error("temporary import failure"))
@@ -253,14 +335,11 @@ describe("lazy overlay lifecycle", () => {
 		const lifecycle = setup(importer);
 		const ctx = createMockCtx({ hasUI: true });
 		await lifecycle.emit("session_start", {}, ctx);
-		setTodos("test-session", [pending("Work")]);
-		await lifecycle.emit("tool_execution_end", { toolName: "todo", isError: true }, ctx);
-		await lifecycle.emit("tool_execution_end", { toolName: "other", isError: false }, ctx);
-		expect(importer).not.toHaveBeenCalled();
+		setTaskState("test-session", pending());
 		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-		await lifecycle.emit("tool_execution_end", { toolName: "todo", isError: false }, ctx);
+		await lifecycle.emit("tool_execution_end", { toolName: "TaskCreate", isError: false }, ctx);
 		expect(warn).toHaveBeenCalledWith(expect.stringContaining("temporary import failure"));
-		await lifecycle.emit("tool_execution_end", { toolName: "todo", isError: false }, ctx);
+		await lifecycle.emit("tool_execution_end", { toolName: "TaskUpdate", isError: false }, ctx);
 		expect(ctx.ui.setWidget).toHaveBeenCalledTimes(1);
 		expect(importer).toHaveBeenCalledTimes(2);
 	});

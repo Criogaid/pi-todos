@@ -75,6 +75,7 @@ describe("config file selection", () => {
 		expect(config.loadSettings()).toMatchObject({
 			guidance: {},
 			resumeContext: true,
+			taskReminder: true,
 			collapseKey: config.DEFAULT_COLLAPSE_KEY,
 			maxWidgetLines: config.DEFAULT_MAX_WIDGET_LINES,
 		});
@@ -89,15 +90,17 @@ describe("config file selection", () => {
 		const { xdg: path } = configPaths();
 		writeConfig(path, {
 			resumeContext: false,
+			taskReminder: false,
 			maxWidgetLines: 5,
 			collapseKey: " Alt+O ",
-			guidance: { description: "Track work" },
+			guidance: { TaskCreate: { description: "Track work" } },
 		});
 		expect(config.loadSettings()).toEqual({
 			resumeContext: false,
+			taskReminder: false,
 			maxWidgetLines: 5,
 			collapseKey: "alt+o",
-			guidance: { description: "Track work" },
+			guidance: { TaskCreate: { description: "Track work" } },
 		});
 		writeConfig(path, { resumeContext: true, collapseKey: "off" });
 		expect(config.loadSettings()).toMatchObject({ resumeContext: true, collapseKey: "off" });
@@ -108,18 +111,44 @@ describe("config file selection", () => {
 		writeConfig(join(homedir(), ".config", "pi-todos", "config.json"), { maxWidgetLines: 7 });
 		expect(config.loadSettings().maxWidgetLines).toBe(7);
 	});
+
+	it.each([false, true, "false", 0, null, undefined])(
+		"disables task reminders only for boolean false: %j",
+		(taskReminder) => {
+			const { xdg: path } = configPaths();
+			writeConfig(path, { taskReminder });
+			expect(config.loadSettings().taskReminder).toBe(taskReminder !== false);
+		},
+	);
 });
 
 describe("setting resolvers", () => {
 	it("keeps valid guidance overrides and drops malformed fields independently", () => {
 		const value = { description: "Custom", promptSnippet: 42, promptGuidelines: ["One", "Two"] };
-		const resolved = config.resolveGuidance(value);
+		const resolved = config.resolveGuidanceFields(value);
 		expect(resolved).toEqual({ description: "Custom", promptGuidelines: ["One", "Two"] });
 		value.promptGuidelines.push("Later");
 		expect(resolved.promptGuidelines).toEqual(["One", "Two"]);
 		for (const input of [undefined, null, [], "x", { description: "", promptGuidelines: ["", "ok"] }]) {
-			expect(config.resolveGuidance(input)).toEqual({});
+			expect(config.resolveGuidanceFields(input)).toEqual({});
 		}
+	});
+
+	it("resolves valid fields independently for each task tool", () => {
+		expect(
+			config.resolveGuidance({
+				TaskCreate: { description: "Create", promptGuidelines: ["Track steps"] },
+				TaskGet: { description: "", promptSnippet: "Read" },
+				TaskList: { promptSnippet: 1, promptGuidelines: [] },
+				TaskUpdate: { description: "Update", promptSnippet: "Change" },
+				UnknownTool: { description: "Ignored" },
+			}),
+		).toEqual({
+			TaskCreate: { description: "Create", promptGuidelines: ["Track steps"] },
+			TaskGet: { promptSnippet: "Read" },
+			TaskUpdate: { description: "Update", promptSnippet: "Change" },
+		});
+		for (const value of [undefined, null, [], "text", 42]) expect(config.resolveGuidance(value)).toEqual({});
 	});
 
 	it.each([undefined, null, "12", 2, 0, -1, 3.5, NaN, Infinity])(

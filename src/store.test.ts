@@ -1,40 +1,50 @@
 import { describe, expect, it } from "vitest";
-import type { Todo } from "./model.js";
+import { makeState, makeTask } from "../test/helpers/index.js";
+import { EMPTY_STATE } from "./model.js";
 import {
+	__resetState,
 	clearForeground,
 	evictSession,
 	getForeground,
-	getForegroundTodos,
-	getTodos,
+	getForegroundState,
+	getTaskState,
 	setForeground,
-	setTodos,
+	setTaskState,
 } from "./store.js";
 
-describe("session store", () => {
-	it("keeps replacements, clearing and eviction local to the specified session", () => {
-		const parent: Todo[] = [{ content: "Parent", status: "pending" }];
-		const child: Todo[] = [{ content: "Child", status: "completed" }];
-		expect(getTodos("missing")).toEqual([]);
-		setTodos("parent", parent);
-		setTodos("child", child);
-		setTodos("parent", []);
-		expect(getTodos("parent")).toEqual([]);
-		expect(getTodos("child")).toEqual(child);
-		evictSession("child");
-		expect(getTodos("child")).toEqual([]);
+describe("session task state", () => {
+	it("keeps states, counters and eviction local to the specified session", () => {
+		const parent = makeState([makeTask()], 8);
+		const child = makeState([makeTask("2")], 10);
+		expect(getTaskState("missing")).toBe(EMPTY_STATE);
+		setTaskState("parent", parent);
+		setTaskState("child", child);
+		setTaskState("parent", makeState([], parent.highWaterMark));
+		expect(getTaskState("parent")).toEqual(makeState([], 8));
+		expect(getTaskState("child")).toBe(child);
+		evictSession("parent");
+		expect(getTaskState("parent")).toBe(EMPTY_STATE);
+		expect(getTaskState("child")).toBe(child);
 	});
 
-	it("renders only the explicitly selected foreground list", () => {
-		setTodos("a", [{ content: "A", status: "pending" }]);
-		setTodos("b", [{ content: "B", status: "in_progress" }]);
-		expect(getForeground()).toBeUndefined();
-		expect(getForegroundTodos()).toEqual([]);
-		setForeground("a");
-		expect(getForegroundTodos()).toEqual(getTodos("a"));
-		setForeground("b");
-		expect(getForegroundTodos()).toEqual(getTodos("b"));
+	it("shows only the selected foreground and resets every session", () => {
+		const first = makeState([makeTask()]);
+		const second = makeState([makeTask("2")]);
+		setTaskState("first", first);
+		setTaskState("second", second);
+		expect(getForegroundState()).toBe(EMPTY_STATE);
+		setForeground("first");
+		expect(getForegroundState()).toBe(first);
+		setForeground("second");
+		expect(getForegroundState()).toBe(second);
 		clearForeground();
-		expect(getForegroundTodos()).toEqual([]);
-		expect(getTodos("b")).toHaveLength(1);
+		expect(getForeground()).toBeUndefined();
+		expect(getForegroundState()).toBe(EMPTY_STATE);
+		expect(getTaskState("first")).toBe(first);
+		setForeground("first");
+		__resetState();
+		expect(getForeground()).toBeUndefined();
+		expect(getTaskState("first")).toBe(EMPTY_STATE);
+		expect(getTaskState("second")).toBe(EMPTY_STATE);
 	});
 });
