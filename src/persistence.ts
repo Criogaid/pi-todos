@@ -1,6 +1,7 @@
 /**
- * Pi persists every tool result in the session branch. A successful `todo`
- * result carries the complete list in `details`, so the latest such result is
+ * Pi persists every tool result in the session branch. A successful direct
+ * `todo` result carries the complete list in `details`, while wrapper tools
+ * like `codemode` record nested calls in `nestedCalls`. The latest such result is
  * the session's todo list — no separate storage, and branch navigation simply
  * picks a different latest result.
  *
@@ -37,15 +38,38 @@ export function decodeSnapshot(details: unknown): Todo[] | undefined {
 	return todos;
 }
 
+function decodeArguments(value: unknown): unknown {
+	if (typeof value === "string") {
+		try {
+			return JSON.parse(value);
+		} catch {
+			return undefined;
+		}
+	}
+	return value;
+}
+
 /** Restore the list from the last valid successful `todo` result on the branch. */
 export function replayFromBranch(branch: Iterable<unknown>): TodoList {
 	let result: TodoList = [];
 	for (const entry of branch) {
 		if (!isRecord(entry) || entry.type !== "message") continue;
 		const msg = entry.message;
-		if (!isRecord(msg) || msg.role !== "toolResult" || msg.toolName !== TOOL_NAME || msg.isError) continue;
-		const todos = decodeSnapshot(msg.details);
-		if (todos) result = todos;
+		if (!isRecord(msg) || msg.role !== "toolResult") continue;
+
+		if (msg.toolName === TOOL_NAME && !msg.isError) {
+			const todos = decodeSnapshot(msg.details);
+			if (todos) result = todos;
+		}
+
+		if (isRecord(msg.nestedCalls) && Array.isArray(msg.nestedCalls.calls)) {
+			for (const call of msg.nestedCalls.calls) {
+				if (isRecord(call) && call.name === TOOL_NAME && call.status === "ok") {
+					const todos = decodeSnapshot(decodeArguments(call.arguments));
+					if (todos) result = todos;
+				}
+			}
+		}
 	}
 	return result;
 }

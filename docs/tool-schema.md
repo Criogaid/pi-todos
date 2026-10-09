@@ -91,6 +91,9 @@ branch, so the latest successful `todo` result *is* the list. On session start,
 compaction and tree navigation the extension walks the branch and restores the
 last valid snapshot; failed results and malformed snapshots are skipped.
 Navigating to another branch point therefore restores the list as it was there.
+When `todo` is invoked inside wrapper tools such as `codemode`, Pi records the
+sub-call in the wrapper result's `nestedCalls`; replay also restores valid snapshots
+from successful nested calls so `/reload` and branch navigation stay accurate.
 
 The tool's renderers draw each result from its own `details`, so a historical
 call in the transcript shows the list as it was at that point, not today's list.

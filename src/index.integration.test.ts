@@ -5,6 +5,7 @@ import {
 	createMockCtx,
 	createMockPi,
 	makeTodoToolResult,
+	makeToolResult,
 	makeUserMessage,
 } from "../test/helpers/index.js";
 import * as config from "./config.js";
@@ -89,6 +90,24 @@ describe("session lifecycle and foreground ownership", () => {
 		await lifecycle.emit("session_tree", {}, ctx);
 		expect(getTodos("main")).toEqual([]);
 		expect(ctx.ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
+	});
+
+	it("recovers state from wrapper tools like codemode after session reload", async () => {
+		const lifecycle = setup();
+		const nestedBranch = [
+			makeTodoToolResult({ todos: [pending("Initial direct")] }),
+			makeToolResult({
+				toolName: "codemode",
+				text: "done",
+				nestedCalls: {
+					complete: true,
+					calls: [{ name: "todo", status: "ok", arguments: { todos: [completed("Finished via codemode")] } }],
+				},
+			}),
+		];
+		const ctx = createMockCtx({ sessionId: "main", hasUI: true, branch: buildSessionEntries(nestedBranch) });
+		await lifecycle.emit("session_start", {}, ctx);
+		expect(getForegroundTodos()).toEqual([completed("Finished via codemode")]);
 	});
 
 	it("dismisses finished foreground work on agent_start and shows a different list", async () => {

@@ -15,6 +15,7 @@ export interface ToolResultInput {
 	text?: string;
 	details?: unknown;
 	isError?: boolean;
+	nestedCalls?: unknown;
 }
 
 export function makeToolResult(input: ToolResultInput): ToolResultMessage {
@@ -24,6 +25,7 @@ export function makeToolResult(input: ToolResultInput): ToolResultMessage {
 		toolName: input.toolName,
 		content: input.text ? [{ type: "text", text: input.text }] : [],
 		details: input.details,
+		nestedCalls: input.nestedCalls,
 		isError: input.isError ?? false,
 		timestamp: Date.now(),
 	} as unknown as ToolResultMessage;

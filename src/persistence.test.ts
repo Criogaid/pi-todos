@@ -1,3 +1,4 @@
+import type { JsonObject } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { makeMessageEntry, makeToolResult, makeUserMessage } from "../test/helpers/index.js";
 import { decodeSnapshot, replayFromBranch } from "./persistence.js";
@@ -73,5 +74,83 @@ describe("replayFromBranch", () => {
 	it("clears on a valid empty snapshot and does not retain state from another replay", () => {
 		expect(replayFromBranch([entry({ todos }), entry({ todos: [] })])).toEqual([]);
 		expect(replayFromBranch([])).toEqual([]);
+	});
+	it("replays snapshots from successful nestedCalls within wrapper tools such as codemode", () => {
+		const directInitial = [{ content: "Direct initial", status: "in_progress" }];
+		const nestedSuccess = [{ content: "Nested done", status: "completed" }];
+		const laterDirect = [{ content: "Later direct", status: "pending" }];
+
+		const branchWithNested = [
+			entry({ todos: directInitial }),
+			makeMessageEntry({
+				role: "toolResult",
+				toolCallId: "call_codemode",
+				toolName: "codemode",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: Date.now(),
+				nestedCalls: {
+					complete: true,
+					calls: [
+						{ id: "call_1", name: "bash", status: "ok", arguments: { command: "ls" } },
+						{ id: "call_2", name: "todo", status: "ok", arguments: { todos: nestedSuccess } },
+					],
+				},
+			}),
+		];
+		expect(replayFromBranch(branchWithNested)).toEqual(nestedSuccess);
+
+		// Later direct call overrides previous nested call
+		expect(replayFromBranch([...branchWithNested, entry({ todos: laterDirect })])).toEqual(laterDirect);
+	});
+
+	it("ignores failed or malformed nestedCalls", () => {
+		const valid = [{ content: "Valid", status: "completed" }];
+		const branch = [
+			entry({ todos: valid }),
+			makeMessageEntry({
+				role: "toolResult",
+				toolCallId: "call_codemode",
+				toolName: "codemode",
+				content: [],
+				isError: false,
+				timestamp: Date.now(),
+				nestedCalls: {
+					complete: true,
+					calls: [
+						{ id: "call_1", name: "todo", status: "error", arguments: { todos: [] } },
+						{ id: "call_2", name: "todo", status: "ok", arguments: { todos: "not an array" } },
+						{ id: "call_3", name: "other", status: "ok", arguments: { todos: [] } },
+					],
+				},
+			}),
+		];
+		expect(replayFromBranch(branch)).toEqual(valid);
+	});
+
+	it("handles stringified arguments in nestedCalls gracefully", () => {
+		const nestedSuccess = [{ content: "Stringified args", status: "completed" }];
+		const branch = [
+			makeMessageEntry({
+				role: "toolResult",
+				toolCallId: "call_codemode",
+				toolName: "codemode",
+				content: [],
+				isError: false,
+				timestamp: Date.now(),
+				nestedCalls: {
+					complete: true,
+					calls: [
+						{
+							id: "call_1",
+							name: "todo",
+							status: "ok",
+							arguments: JSON.stringify({ todos: nestedSuccess }) as unknown as JsonObject,
+						},
+					],
+				},
+			}),
+		];
+		expect(replayFromBranch(branch)).toEqual(nestedSuccess);
 	});
 });
