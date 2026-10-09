@@ -10,6 +10,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Support restoring snapshots from `nestedCalls` (e.g. `codemode` scripts calling `tools.todo`) during `/reload` and branch navigation.
+- Persist normalized todo snapshots as versioned custom session entries so converted inputs and calls omitted from wrapper diagnostics survive reload. Later records for the same call cannot overwrite the saved snapshot.
 
 ## [0.1.0] - 2026-10-08
 

@@ -86,14 +86,25 @@ An empty list answers `Todo list cleared.`
 
 ## Persistence and replay
 
-`details` is the persistence format. Pi stores every tool result in the session
-branch, so the latest successful `todo` result *is* the list. On session start,
-compaction and tree navigation the extension walks the branch and restores the
-last valid snapshot; failed results and malformed snapshots are skipped.
-Navigating to another branch point therefore restores the list as it was there.
-When `todo` is invoked inside wrapper tools such as `codemode`, Pi records the
-sub-call in the wrapper result's `nestedCalls`; replay also restores valid snapshots
-from successful nested calls so `/reload` and branch navigation stay accurate.
+Each `todo` write saves its normalized list with `pi.appendEntry()` before
+replacing live state. The custom entry contains `data: { version, toolCallId, todos }`;
+its type and format version are defined in
+[`src/persistence.ts`](../src/persistence.ts). These entries remain on the session
+branch without entering model context.
+
+On session start, compaction and tree navigation, replay walks the branch in
+order and restores the latest valid snapshot. Later direct results or nested-call
+records with the same call id are skipped so they cannot overwrite the saved
+state. Failed writes leave the live list unchanged. Navigating to another branch
+point restores the list saved there.
+
+Wrapper tools such as `codemode` may omit arguments or calls from their bounded
+`nestedCalls` records. The saved snapshots preserve the complete list regardless
+of those limits, including Pi's parameter conversions and the tool's trimming.
+
+Older sessions without custom snapshots still replay successful direct results
+and decodable nested arguments. Arguments already omitted from an old session
+cannot be recovered. Malformed snapshots and unsupported format versions are skipped.
 
 The tool's renderers draw each result from its own `details`, so a historical
 call in the transcript shows the list as it was at that point, not today's list.

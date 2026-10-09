@@ -1,20 +1,25 @@
 /**
- * Pi persists every tool result in the session branch. A successful direct
- * `todo` result carries the complete list in `details`, while wrapper tools
- * like `codemode` record nested calls in `nestedCalls`. The latest such result is
- * the session's todo list — no separate storage, and branch navigation simply
- * picks a different latest result.
+ * Every todo write saves a versioned custom entry on the session branch before
+ * updating live state. The entry holds the normalized list and its tool-call id;
+ * later tool results and wrapper records for that id cannot overwrite it.
+ * Direct results and nested arguments remain a fallback for older sessions.
  *
- * `decodeSnapshot` is the only reader of persisted data; replay and the result
- * renderer share it.
+ * `decodeSnapshot` reads the shared list shape for replay and result rendering.
  */
 
 import { isRecord, isTodoStatus, type Todo, type TodoList } from "./model.js";
 
 export const TOOL_NAME = "todo";
+export const TODO_SNAPSHOT_TYPE = "pi-todos-snapshot";
+export const TODO_SNAPSHOT_VERSION = 1;
 
 export interface TodoDetails {
 	todos: Todo[];
+}
+
+export interface TodoSnapshot extends TodoDetails {
+	version: typeof TODO_SNAPSHOT_VERSION;
+	toolCallId: string;
 }
 
 function decodeTodo(value: unknown): Todo | undefined {
@@ -49,22 +54,49 @@ function decodeArguments(value: unknown): unknown {
 	return value;
 }
 
-/** Restore the list from the last valid successful `todo` result on the branch. */
+/** Restore the latest write on the branch, preferring saved snapshots over duplicate call records. */
 export function replayFromBranch(branch: Iterable<unknown>): TodoList {
 	let result: TodoList = [];
+	const savedCalls = new Set<string>();
 	for (const entry of branch) {
-		if (!isRecord(entry) || entry.type !== "message") continue;
+		if (!isRecord(entry)) continue;
+		if (entry.type === "custom" && entry.customType === TODO_SNAPSHOT_TYPE) {
+			const data = entry.data;
+			if (
+				isRecord(data) &&
+				data.version === TODO_SNAPSHOT_VERSION &&
+				typeof data.toolCallId === "string" &&
+				data.toolCallId.trim()
+			) {
+				const todos = decodeSnapshot(data);
+				if (todos) {
+					result = todos;
+					savedCalls.add(data.toolCallId);
+				}
+			}
+			continue;
+		}
+		if (entry.type !== "message") continue;
 		const msg = entry.message;
 		if (!isRecord(msg) || msg.role !== "toolResult") continue;
 
-		if (msg.toolName === TOOL_NAME && !msg.isError) {
+		if (
+			msg.toolName === TOOL_NAME &&
+			!msg.isError &&
+			!(typeof msg.toolCallId === "string" && savedCalls.has(msg.toolCallId))
+		) {
 			const todos = decodeSnapshot(msg.details);
 			if (todos) result = todos;
 		}
 
 		if (isRecord(msg.nestedCalls) && Array.isArray(msg.nestedCalls.calls)) {
 			for (const call of msg.nestedCalls.calls) {
-				if (isRecord(call) && call.name === TOOL_NAME && call.status === "ok") {
+				if (
+					isRecord(call) &&
+					call.name === TOOL_NAME &&
+					call.status === "ok" &&
+					!(typeof call.id === "string" && savedCalls.has(call.id))
+				) {
 					const todos = decodeSnapshot(decodeArguments(call.arguments));
 					if (todos) result = todos;
 				}

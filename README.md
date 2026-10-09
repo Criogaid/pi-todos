@@ -62,9 +62,9 @@ by status.
 - **One simple contract for the model.** Each `todo` call sends the complete,
   ordered list and replaces the previous one. There are no ids, partial updates
   or dependency graphs to get wrong; at most one item is `in_progress`.
-- **The list survives `/reload` and compaction.** Every result carries the full
-  list, and the latest one on the session branch is restored. Moving around the
-  session tree restores the list as it was at that point.
+- **The list survives `/reload` and compaction.** Each write saves a normalized
+  snapshot in the Pi session, including calls made inside `codemode`. Moving
+  around the session tree restores the list as it was on that branch.
 - **The transcript stays truthful.** Each historical `todo` call renders from its
   own saved list, so old entries keep showing what the list was then.
 - **Resume with the current list in context.** After session restore, compaction

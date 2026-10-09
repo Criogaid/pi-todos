@@ -1,10 +1,9 @@
 /**
  * The `todo` tool and the `/todos` command.
  *
- * Every call replaces the session's list with the submitted one. The result's
- * `details` holds that list, which makes each result self-describing: replay
- * reads the latest one, and the renderers draw a historical result from its
- * own snapshot instead of today's state.
+ * Every call saves a normalized snapshot on the session branch, then replaces
+ * the live list. Result `details` carries the same list so historical calls
+ * render their own state.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -15,7 +14,14 @@ import type { GuidanceFields } from "./config.js";
 import { formatCommandLine, formatCountsHeader, formatThemedLine, formatToolResponse } from "./format.js";
 import { sessionIdOf } from "./host.js";
 import { countTodos, currentTodo, isRecord, MAX_TODOS, normalizeTodos, TODO_STATUSES, type TodoList } from "./model.js";
-import { decodeSnapshot, TOOL_NAME, type TodoDetails } from "./persistence.js";
+import {
+	decodeSnapshot,
+	TODO_SNAPSHOT_TYPE,
+	TODO_SNAPSHOT_VERSION,
+	TOOL_NAME,
+	type TodoDetails,
+	type TodoSnapshot,
+} from "./persistence.js";
 import { sanitizeTerminalText } from "./sanitize.js";
 import { getTodos, setTodos } from "./store.js";
 
@@ -66,12 +72,16 @@ export function registerTodoTool(pi: ExtensionAPI, guidance: GuidanceFields = {}
 		parameters: TodoParamsSchema,
 		executionMode: "sequential",
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			// A thrown error becomes a failed tool result and leaves the list untouched.
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const todos = normalizeTodos(params.todos);
-			setTodos(sessionIdOf(ctx), todos);
+			const sessionId = sessionIdOf(ctx);
 			const details: TodoDetails = { todos };
-			return { content: [{ type: "text", text: formatToolResponse(todos) }], details };
+			const result = { content: [{ type: "text" as const, text: formatToolResponse(todos) }], details };
+			const snapshot: TodoSnapshot = { version: TODO_SNAPSHOT_VERSION, toolCallId, todos };
+			// Persist before changing live state; wrapper diagnostics may omit the call or its arguments.
+			pi.appendEntry(TODO_SNAPSHOT_TYPE, snapshot);
+			setTodos(sessionId, todos);
+			return result;
 		},
 
 		renderCall(args, theme) {
