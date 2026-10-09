@@ -1,107 +1,87 @@
 /**
- * Every todo write saves a versioned custom entry on the session branch before
- * updating live state. The entry holds the normalized list and its tool-call id;
- * later tool results and wrapper records for that id cannot overwrite it.
- * Direct results and nested arguments remain a fallback for older sessions.
- *
- * `decodeSnapshot` reads the shared list shape for replay and result rendering.
+ * Every change to a task list saves the whole list as a versioned custom
+ * entry on the session branch before live state is replaced. Calls made inside
+ * wrapper tools such as `codemode` save their own entries too, so replay only
+ * needs these entries. Custom entries never enter model context.
  */
 
-import { isRecord, isTodoStatus, type Todo, type TodoList } from "./model.js";
+import { EMPTY_STATE, isRecord, isTaskStatus, type Task, type TaskState } from "./model.js";
 
-export const TOOL_NAME = "todo";
-export const TODO_SNAPSHOT_TYPE = "pi-todos-snapshot";
-export const TODO_SNAPSHOT_VERSION = 1;
+export const TASKS_SNAPSHOT_TYPE = "pi-todos-tasks";
+export const TASKS_SNAPSHOT_VERSION = 1;
 
-export interface TodoDetails {
-	todos: Todo[];
+export interface TaskSnapshot {
+	version: typeof TASKS_SNAPSHOT_VERSION;
+	tasks: Task[];
+	highWaterMark: number;
+	/** The tool call that wrote it; absent when the extension cleared a finished list. */
+	toolCallId?: string;
 }
 
-export interface TodoSnapshot extends TodoDetails {
-	version: typeof TODO_SNAPSHOT_VERSION;
-	toolCallId: string;
+export function snapshotOf(state: TaskState, toolCallId?: string): TaskSnapshot {
+	const snapshot: TaskSnapshot = {
+		version: TASKS_SNAPSHOT_VERSION,
+		tasks: state.tasks.map((task) => structuredClone(task)),
+		highWaterMark: state.highWaterMark,
+	};
+	if (toolCallId !== undefined) snapshot.toolCallId = toolCallId;
+	return snapshot;
 }
 
-function decodeTodo(value: unknown): Todo | undefined {
-	if (!isRecord(value) || typeof value.content !== "string" || !value.content.trim()) return undefined;
-	if (!isTodoStatus(value.status)) return undefined;
-	if (value.activeForm !== undefined && typeof value.activeForm !== "string") return undefined;
-	const todo: Todo = { content: value.content, status: value.status };
-	if (value.activeForm) todo.activeForm = value.activeForm;
-	return todo;
+const TASK_ID = /^[1-9][0-9]*$/;
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
-/** Decode a result's `details` into a todo list, or `undefined` when it is not a valid snapshot. */
-export function decodeSnapshot(details: unknown): Todo[] | undefined {
-	if (!isRecord(details) || !Array.isArray(details.todos)) return undefined;
-	const todos: Todo[] = [];
-	for (const item of details.todos) {
-		const todo = decodeTodo(item);
-		if (!todo) return undefined;
-		todos.push(todo);
+function decodeTask(value: unknown, highWaterMark: number): Task | undefined {
+	if (!isRecord(value)) return undefined;
+	const { id, subject, description, status, activeForm, owner, blocks, blockedBy, metadata } = value;
+	if (typeof id !== "string" || !TASK_ID.test(id) || Number(id) > highWaterMark) return undefined;
+	if (typeof subject !== "string" || typeof description !== "string" || !isTaskStatus(status)) return undefined;
+	if (activeForm !== undefined && typeof activeForm !== "string") return undefined;
+	if (owner !== undefined && typeof owner !== "string") return undefined;
+	if (!isStringArray(blocks) || !isStringArray(blockedBy)) return undefined;
+	if (metadata !== undefined && !isRecord(metadata)) return undefined;
+	const task: Task = { id, subject, description, status, blocks: [...blocks], blockedBy: [...blockedBy] };
+	if (activeForm !== undefined) task.activeForm = activeForm;
+	if (owner !== undefined) task.owner = owner;
+	if (metadata !== undefined) task.metadata = structuredClone(metadata);
+	return task;
+}
+
+/** Decode a snapshot's data, or `undefined` when it is malformed or from another format version. */
+export function decodeSnapshot(data: unknown): TaskState | undefined {
+	if (!isRecord(data) || data.version !== TASKS_SNAPSHOT_VERSION || !Array.isArray(data.tasks)) return undefined;
+	const highWaterMark = data.highWaterMark;
+	if (typeof highWaterMark !== "number" || !Number.isSafeInteger(highWaterMark) || highWaterMark < 0) return undefined;
+	const tasks: Task[] = [];
+	const ids = new Set<string>();
+	for (const item of data.tasks) {
+		const task = decodeTask(item, highWaterMark);
+		if (!task || ids.has(task.id)) return undefined;
+		ids.add(task.id);
+		tasks.push(task);
 	}
-	return todos;
-}
-
-function decodeArguments(value: unknown): unknown {
-	if (typeof value === "string") {
-		try {
-			return JSON.parse(value);
-		} catch {
-			return undefined;
-		}
+	// Drop edges to tasks the snapshot does not contain, so every edge resolves.
+	for (const task of tasks) {
+		task.blocks = task.blocks.filter((id) => id !== task.id && ids.has(id));
+		task.blockedBy = task.blockedBy.filter((id) => id !== task.id && ids.has(id));
 	}
-	return value;
+	return { tasks, highWaterMark };
 }
 
-/** Restore the latest write on the branch, preferring saved snapshots over duplicate call records. */
-export function replayFromBranch(branch: Iterable<unknown>): TodoList {
-	let result: TodoList = [];
-	const savedCalls = new Set<string>();
+export function isSnapshotEntry(entry: unknown): entry is { type: "custom"; customType: string; data?: unknown } {
+	return isRecord(entry) && entry.type === "custom" && entry.customType === TASKS_SNAPSHOT_TYPE;
+}
+
+/** Restore the latest valid snapshot on the branch. Malformed snapshots are skipped. */
+export function replayFromBranch(branch: Iterable<unknown>): TaskState {
+	let result: TaskState = EMPTY_STATE;
 	for (const entry of branch) {
-		if (!isRecord(entry)) continue;
-		if (entry.type === "custom" && entry.customType === TODO_SNAPSHOT_TYPE) {
-			const data = entry.data;
-			if (
-				isRecord(data) &&
-				data.version === TODO_SNAPSHOT_VERSION &&
-				typeof data.toolCallId === "string" &&
-				data.toolCallId.trim()
-			) {
-				const todos = decodeSnapshot(data);
-				if (todos) {
-					result = todos;
-					savedCalls.add(data.toolCallId);
-				}
-			}
-			continue;
-		}
-		if (entry.type !== "message") continue;
-		const msg = entry.message;
-		if (!isRecord(msg) || msg.role !== "toolResult") continue;
-
-		if (
-			msg.toolName === TOOL_NAME &&
-			!msg.isError &&
-			!(typeof msg.toolCallId === "string" && savedCalls.has(msg.toolCallId))
-		) {
-			const todos = decodeSnapshot(msg.details);
-			if (todos) result = todos;
-		}
-
-		if (isRecord(msg.nestedCalls) && Array.isArray(msg.nestedCalls.calls)) {
-			for (const call of msg.nestedCalls.calls) {
-				if (
-					isRecord(call) &&
-					call.name === TOOL_NAME &&
-					call.status === "ok" &&
-					!(typeof call.id === "string" && savedCalls.has(call.id))
-				) {
-					const todos = decodeSnapshot(decodeArguments(call.arguments));
-					if (todos) result = todos;
-				}
-			}
-		}
+		if (!isSnapshotEntry(entry)) continue;
+		const state = decodeSnapshot(entry.data);
+		if (state) result = state;
 	}
 	return result;
 }

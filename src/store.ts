@@ -1,10 +1,10 @@
-import { EMPTY_TODOS, type TodoList } from "./model.js";
+import { EMPTY_STATE, type TaskState } from "./model.js";
 
 /**
- * Live todo lists keyed by session id, so a detached or child session in the
+ * Live task lists keyed by session id, so a detached or child session in the
  * same process can never read or overwrite another session's list.
  */
-const sessions = new Map<string, TodoList>();
+const sessions = new Map<string, TaskState>();
 
 /**
  * The session whose list the UI shows. Renderers have no session context, so
@@ -13,12 +13,12 @@ const sessions = new Map<string, TodoList>();
  */
 let foreground: string | undefined;
 
-export function getTodos(sessionId: string): TodoList {
-	return sessions.get(sessionId) ?? EMPTY_TODOS;
+export function getTaskState(sessionId: string): TaskState {
+	return sessions.get(sessionId) ?? EMPTY_STATE;
 }
 
-export function setTodos(sessionId: string, todos: TodoList): void {
-	sessions.set(sessionId, todos);
+export function setTaskState(sessionId: string, state: TaskState): void {
+	sessions.set(sessionId, state);
 }
 
 export function evictSession(sessionId: string): void {
@@ -37,8 +37,8 @@ export function clearForeground(): void {
 	foreground = undefined;
 }
 
-export function getForegroundTodos(): TodoList {
-	return foreground === undefined ? EMPTY_TODOS : getTodos(foreground);
+export function getForegroundState(): TaskState {
+	return foreground === undefined ? EMPTY_STATE : getTaskState(foreground);
 }
 
 /** Drop all module state. The store is process-global, so test isolation needs this. */

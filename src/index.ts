@@ -1,12 +1,14 @@
 /**
- * pi-todos — registers the `todo` tool, the `/todos` command and the overlay,
- * and maps Pi lifecycle events onto them:
+ * pi-todos — registers Claude Code's task tools (TaskCreate, TaskGet,
+ * TaskList, TaskUpdate), the `/tasks` command and the overlay, and maps Pi
+ * lifecycle events onto them:
  *
  * - session start / compaction / tree navigation: replay the list from the
  *   branch and owe the model one resume summary;
  * - `context`: send that summary; a successful assistant message acknowledges it;
- * - a successful `todo` call: refresh the overlay;
- * - agent start: dismiss a finished list;
+ * - a successful TaskCreate or TaskUpdate call: refresh the overlay;
+ * - agent start: clear a finished list, keeping the id counter;
+ * - turn end: remind the model of the task tools after 10 turns without them;
  * - shutdown: drop the session's state and, for the foreground, the overlay.
  */
 
@@ -14,20 +16,23 @@ import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding
 import type { KeyId } from "@earendil-works/pi-tui";
 import { COLLAPSE_KEY_OFF, loadSettings } from "./config.js";
 import { formatError, type SessionCtx, sessionIdOf, unlessStale } from "./host.js";
+import { isFinished, resetTasks, visibleTasks } from "./model.js";
+import { TASK_CREATE, TASK_WRITE_TOOL_NAMES } from "./names.js";
 import type { TodoOverlay } from "./overlay.js";
 import { isStaleOverlayModuleError, makeOverlayLoader, type OverlayImporter } from "./overlay-loader.js";
-import { replayFromBranch } from "./persistence.js";
+import { replayFromBranch, snapshotOf, TASKS_SNAPSHOT_TYPE } from "./persistence.js";
+import { isReminderDue, REMINDER_MESSAGE_TYPE, REMINDER_TEXT } from "./reminder.js";
 import { buildResumeContext, ResumeTracker } from "./resume.js";
 import {
 	clearForeground,
 	evictSession,
 	getForeground,
-	getForegroundTodos,
-	getTodos,
+	getForegroundState,
+	getTaskState,
 	setForeground,
-	setTodos,
+	setTaskState,
 } from "./store.js";
-import { registerTodosCommand, registerTodoTool, TOOL_NAME } from "./tool.js";
+import { registerTasksCommand, registerTaskTools } from "./tool.js";
 
 /** Delay before pre-warming the overlay module, so Pi's startup work settles first. */
 export const PREWARM_DELAY_MS = 2000;
@@ -43,7 +48,7 @@ export default function (pi: ExtensionAPI, importOverlay?: OverlayImporter) {
 	let uiGeneration = 0;
 
 	async function refreshOverlay(generation = uiGeneration): Promise<void> {
-		if (!ui || (!overlay && getForegroundTodos().length === 0)) return;
+		if (!ui || (!overlay && visibleTasks(getForegroundState()).length === 0)) return;
 		const { TodoOverlay } = await loadOverlay();
 		if (generation !== uiGeneration || !ui) return;
 		overlay ??= new TodoOverlay({ maxWidgetLines: settings.maxWidgetLines, collapseKey: settings.collapseKey });
@@ -51,22 +56,32 @@ export default function (pi: ExtensionAPI, importOverlay?: OverlayImporter) {
 		overlay.update();
 	}
 
+	/** A failed refresh only costs this redraw; the latched stale-module error needs a restart, so surface it. */
+	async function refreshOverlaySafely(): Promise<void> {
+		try {
+			await refreshOverlay();
+		} catch (error) {
+			if (isStaleOverlayModuleError(error)) throw error;
+			console.warn(`[pi-todos] overlay refresh failed (will retry on next update): ${formatError(error)}`);
+		}
+	}
+
 	/** Replay a session's list from its branch. Returns its id, or undefined if the ctx is stale. */
 	function restore(ctx: SessionCtx): string | undefined {
 		return unlessStale(() => {
 			const id = sessionIdOf(ctx);
-			setTodos(id, replayFromBranch(ctx.sessionManager.getBranch()));
+			setTaskState(id, replayFromBranch(ctx.sessionManager.getBranch()));
 			if (settings.resumeContext) resume.mark(id);
 			return id;
 		});
 	}
 
-	registerTodoTool(pi, settings.guidance);
-	registerTodosCommand(pi);
+	registerTaskTools(pi, settings.guidance);
+	registerTasksCommand(pi);
 
 	if (settings.collapseKey !== COLLAPSE_KEY_OFF) {
 		pi.registerShortcut(settings.collapseKey as KeyId, {
-			description: "Collapse or expand the todo overlay",
+			description: "Collapse or expand the task overlay",
 			handler: (ctx) => {
 				if (ctx.hasUI && overlay?.isRegistered()) overlay.toggleCollapse();
 			},
@@ -114,7 +129,7 @@ export default function (pi: ExtensionAPI, importOverlay?: OverlayImporter) {
 	pi.on("context", (event, ctx) => {
 		const id = unlessStale(() => sessionIdOf(ctx));
 		if (id === undefined || !resume.begin(id)) return;
-		const content = buildResumeContext(getTodos(id));
+		const content = buildResumeContext(getTaskState(id));
 		if (!content) {
 			resume.drop(id);
 			return;
@@ -135,19 +150,42 @@ export default function (pi: ExtensionAPI, importOverlay?: OverlayImporter) {
 	});
 
 	pi.on("tool_execution_end", async (event) => {
-		if (event.toolName !== TOOL_NAME || event.isError) return;
-		try {
-			await refreshOverlay();
-		} catch (error) {
-			// The tool call itself succeeded; a transient load failure only costs
-			// this refresh. The latched stale-module error needs a restart, so surface it.
-			if (isStaleOverlayModuleError(error)) throw error;
-			console.warn(`[pi-todos] overlay refresh failed (will retry on next update): ${formatError(error)}`);
-		}
+		if (!TASK_WRITE_TOOL_NAMES.includes(event.toolName) || event.isError) return;
+		await refreshOverlaySafely();
 	});
 
-	pi.on("agent_start", (_event, ctx) => {
-		if (unlessStale(() => sessionIdOf(ctx)) === getForeground()) overlay?.dismissIfFinished();
+	// Claude Code clears a finished list shortly after its last task completes.
+	// Doing it when the next run starts keeps the finished list on screen until
+	// the user moves on. The snapshot has no call id: it is not a model call.
+	pi.on("agent_start", async (_event, ctx) => {
+		const id = unlessStale(() => sessionIdOf(ctx));
+		if (id === undefined) return;
+		const state = getTaskState(id);
+		if (!isFinished(state)) return;
+		const cleared = resetTasks(state);
+		pi.appendEntry(TASKS_SNAPSHOT_TYPE, snapshotOf(cleared));
+		setTaskState(id, cleared);
+		if (id === getForeground()) await refreshOverlaySafely();
+	});
+
+	// The reminder is persisted as a hidden message, so it reaches the next
+	// model request and later turns can count back to it.
+	pi.on("turn_end", (event, ctx) => {
+		if (!settings.taskReminder || event.outcome !== "completed") return;
+		if (!pi.getActiveTools().includes(TASK_CREATE)) return;
+		const due = unlessStale(() => isReminderDue(ctx.sessionManager.getBranch()));
+		if (!due) return;
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message" as const,
+					customType: REMINDER_MESSAGE_TYPE,
+					content: REMINDER_TEXT,
+					display: false,
+				},
+			],
+		};
 	});
 
 	// Evaluate the overlay module after startup while Pi's dependency paths are

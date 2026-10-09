@@ -1,23 +1,29 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { TASK_TOOL_NAMES, type TaskToolName } from "./names.js";
 
-/** Prompt-copy overrides for the `todo` tool. */
+/** Prompt-copy overrides for one task tool. */
 export interface GuidanceFields {
 	description?: string;
 	promptSnippet?: string;
 	promptGuidelines?: string[];
 }
 
+/** Overrides keyed by tool name; a tool without an entry keeps its built-in copy. */
+export type Guidance = Partial<Record<TaskToolName, GuidanceFields>>;
+
 /**
  * Settings are read once, when Pi loads the extension. `/reload` re-runs the
  * extension factory, which is the single way to apply a config change — so the
  * bound shortcut, the hint that names it and the row budget never disagree.
  */
-export interface TodoSettings {
-	guidance: GuidanceFields;
-	/** Inject one bounded unfinished-item summary after restore or compaction. */
+export interface TaskSettings {
+	guidance: Guidance;
+	/** Inject one bounded unfinished-task summary after restore or compaction. */
 	resumeContext: boolean;
+	/** Remind the model about the task tools after 10 turns without a TaskCreate or TaskUpdate call. */
+	taskReminder: boolean;
 	/** Overlay content-row budget, heading included. */
 	maxWidgetLines: number;
 	/** Validated, lowercased collapse key, or `COLLAPSE_KEY_OFF`. */
@@ -61,18 +67,31 @@ function readConfig(): Record<string, unknown> {
 	}
 }
 
-export function loadSettings(): TodoSettings {
+export function loadSettings(): TaskSettings {
 	const raw = readConfig();
 	return {
 		guidance: resolveGuidance(raw.guidance),
 		resumeContext: raw.resumeContext !== false,
+		taskReminder: raw.taskReminder !== false,
 		maxWidgetLines: resolveMaxWidgetLines(raw.maxWidgetLines),
 		collapseKey: resolveCollapseKey(raw.collapseKey),
 	};
 }
 
+/** Resolve each tool's overrides; unknown tool names are ignored. */
+export function resolveGuidance(value: unknown): Guidance {
+	if (value === null || typeof value !== "object") return {};
+	const raw = value as Record<string, unknown>;
+	const guidance: Guidance = {};
+	for (const name of TASK_TOOL_NAMES) {
+		const fields = resolveGuidanceFields(raw[name]);
+		if (Object.keys(fields).length > 0) guidance[name] = fields;
+	}
+	return guidance;
+}
+
 /** Keep only valid overrides: non-empty strings and a non-empty array of non-empty strings. */
-export function resolveGuidance(value: unknown): GuidanceFields {
+export function resolveGuidanceFields(value: unknown): GuidanceFields {
 	if (value === null || typeof value !== "object") return {};
 	const raw = value as Record<string, unknown>;
 	const guidance: GuidanceFields = {};

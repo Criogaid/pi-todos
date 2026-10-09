@@ -28,12 +28,15 @@ extension only reads it.
   "maxWidgetLines": 8,
   "collapseKey": "alt+t",
   "resumeContext": true,
+  "taskReminder": false,
   "guidance": {
-    "promptSnippet": "Use the `todo` tool to track multi-step work before starting it.",
-    "promptGuidelines": [
-      "Send the complete list on every call.",
-      "Mark an item in_progress while working on it; completed when done."
-    ]
+    "TaskCreate": {
+      "promptSnippet": "Create a task before starting any multi-step work.",
+      "promptGuidelines": [
+        "Create one task per step before you start.",
+        "Set a task to in_progress when you start it and completed when it is done."
+      ]
+    }
   }
 }
 ```
@@ -54,7 +57,7 @@ budget, so `12` renders up to 13 terminal rows.
 - Must be an integer of at least `3`; anything else falls back to the default.
 - No ceiling.
 - Pi's tool-output expansion mode (`ctrl+o` by default) temporarily overrides
-  this budget and shows every item; collapsing restores the configured budget.
+  this budget and shows every task; collapsing restores the configured budget.
 
 ## `collapseKey`
 
@@ -80,24 +83,27 @@ Examples: `alt+o`, `ctrl+shift+t`, `super+alt+f5`.
 
 ## Guidance
 
-`guidance.description`, `guidance.promptSnippet` (strings) and
-`guidance.promptGuidelines` (array of strings) replace the tool description and
-prompt copy the `todo` tool advertises to the model. All are absent by default,
-in which case the built-in text is used.
+`guidance` is keyed by tool name: `TaskCreate`, `TaskGet`, `TaskList` and
+`TaskUpdate`. Each entry may set `description`, `promptSnippet` (strings) and
+`promptGuidelines` (array of strings), which replace that tool's description
+and the prompt copy it advertises to the model. A tool or field without an
+override keeps the built-in text: Claude Code's tool descriptions, and on
+`TaskCreate` the guideline to mark each task completed as soon as it is done.
+Other keys under `guidance` are ignored.
 
 - `description` and `promptSnippet` must be non-empty strings; an empty string or
   a wrong type falls back to the default.
 - `promptGuidelines` must be a non-empty array of non-empty strings. A non-array,
   or an array containing an empty string, falls back to the default — the array
   is all-or-nothing, not merged item by item.
-- Custom guidance should describe the full-list replacement model; calls in
-  any other shape fail schema validation.
+- Custom guidance should describe the tools' actual parameters; calls in any
+  other shape fail schema validation.
 
 ## `resumeContext`
 
 Defaults to `true`; only boolean `false` disables it. After `session_start`,
 `session_compact` or `session_tree`, the next model-context hook for that
-session adds one summary of unfinished items. It is transient context, not
+session adds one summary of unfinished tasks. It is transient context, not
 another stored transcript entry, and also runs during a continuation immediately
 after auto-compaction. No summary is added for an empty or fully completed list.
 
@@ -105,11 +111,22 @@ A successful assistant response acknowledges the summary. Error or aborted
 responses keep it so a session-level retry receives it again. A later lifecycle
 event creates a new generation that an earlier request cannot acknowledge.
 
-Summaries contain at most 20 unfinished items and 6,000 UTF-16 characters; each
-item's content is limited to 160 Unicode code points. The footer states how many
-unfinished items were omitted and how many completed items exist, so the model
-knows to keep them when it resends the list. Saved text is quoted as data, and
-current user instructions take precedence.
+Summaries list in-progress tasks first, then pending ones, each with its id,
+status, subject and open blockers. They contain at most 20 tasks and 6,000
+UTF-16 characters; each subject is limited to 160 Unicode code points. The
+footer states how many unfinished tasks were omitted and how many completed
+tasks exist, and the header points the model to `TaskList`, `TaskGet` and
+`TaskUpdate`. Saved text is quoted as data, and current user instructions take
+precedence.
+
+## `taskReminder`
+
+Defaults to `true`; only boolean `false` disables it. When it is on, a hidden
+reminder to use the task tools is added at the end of a turn once 10 assistant
+turns have passed since the last `TaskCreate` or `TaskUpdate` call and since
+the previous reminder. This matches Claude Code's task reminder, including its
+text. The reminder is stored in the session but not displayed. It is skipped
+after an aborted or failed turn and while `TaskCreate` is not an active tool.
 
 ## Environment variables
 

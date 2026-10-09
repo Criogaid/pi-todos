@@ -7,10 +7,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Fixed
+### Changed
 
-- Support restoring snapshots from `nestedCalls` (e.g. `codemode` scripts calling `tools.todo`) during `/reload` and branch navigation.
-- Persist normalized todo snapshots as versioned custom session entries so converted inputs and calls omitted from wrapper diagnostics survive reload. Later records for the same call cannot overwrite the saved snapshot.
+- **Breaking:** the `todo` tool is replaced by Claude Code's task tools: `TaskCreate`, `TaskGet`, `TaskList` and `TaskUpdate`. Tasks have sequential ids that are never reused; `TaskUpdate` changes only the fields it names, adds two-way `blocks`/`blockedBy` edges, merges `metadata` and deletes a task with `status: "deleted"`. Tool descriptions and the text the model reads back follow Claude Code. Any number of tasks may be `in_progress`, and the 100-item limit is gone.
+- **Breaking:** lists saved by the `todo` tool are not restored. Task lists are saved as `pi-todos-tasks` session entries.
+- **Breaking:** `/todos` is renamed `/tasks`.
+- **Breaking:** `guidance` in the config file is keyed by tool name (`{"guidance": {"TaskCreate": {...}}}`).
+- The overlay heading reads `Tasks (done/total)`, and rows show task ids, owners and open blockers. Tasks with `metadata._internal: true` are hidden.
+- A finished list is cleared when the next agent run starts, keeping the id counter, instead of being hidden.
+- The resume summary lists task ids and open blockers.
+
+### Added
+
+- Tool results carry `structuredContent` and declare an `outputSchema`, so `codemode` scripts receive structured output such as a new task's id.
+- Argument repair for `id`/`task_id` → `taskId`, `active_form` → `activeForm`, and ids written as numbers or with a leading `#`.
+- Claude Code's task reminder: a hidden message after 10 turns without `TaskCreate` or `TaskUpdate`. Disable it with `"taskReminder": false`.
 
 ## [0.1.0] - 2026-10-08
 

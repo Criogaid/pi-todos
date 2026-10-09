@@ -2,11 +2,12 @@
 	"name": "@criogaid/pi-todos",
 	"private": true,
 	"version": "0.1.0",
-	"description": "Pi extension. A todo list for the model, rendered as a live overlay that survives /reload and conversation compaction.",
+	"description": "Pi extension. Claude Code's task tools for the model, rendered as a live overlay that survives /reload and conversation compaction.",
 	"keywords": [
 		"pi-package",
 		"pi-extension",
-		"todo"
+		"todo",
+		"tasks"
 	],
 	"type": "module",
 	"license": "MIT",
