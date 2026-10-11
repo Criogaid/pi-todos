@@ -37,12 +37,14 @@ one response what would otherwise take several:
   so the model notices a task it forgot to complete. Nothing is blocked or
   changed.
 - The descriptions drop the advice to read a task before every update or list
-  tasks after every completion or before every creation. They require independent
-  task-tool calls in one assistant message, including creates, reads, updates and
-  cleanup deletions. Task tools execute sequentially; execution order alone does
-  not require another model turn. Wait only when a later call needs an earlier
-  result, such as a new task id. Complete a task and start the next with a known
-  id in the same message.
+  tasks after every completion or before every creation. They require submitting
+  independent calls together before reading any results, through an available
+  batch dispatcher (such as `multi_tool_use.parallel`) or a message containing
+  multiple calls. This includes creates, reads, updates and cleanup deletions.
+  Sending one call, waiting for its result, then sending the next independent
+  call is not batching. Wait only when a later call needs an earlier result,
+  such as a new task id. Complete a task and start the next with a known id
+  in the same batch.
 
 ## `TaskCreate`
 
