@@ -25,7 +25,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `TaskCreate` takes optional `status`, `addBlocks` and `addBlockedBy`, so a task can start `in_progress` and depend on existing tasks in the same call.
 - A `TaskUpdate` that completes or deletes a task names the next available task in its text (`Next available task: #<id> <subject>`) and as `nextTask` in its structured output.
 - Starting a task while others are still `in_progress` (with `TaskCreate` or `TaskUpdate`) lists them in the result (`Also in progress: #2, #5. …`) and as `alsoInProgress`. Nothing is blocked or changed.
-- Tool descriptions and guidelines ask for related task calls in one response — parallel `TaskCreate` calls, and completing a task together with starting the next — and drop Claude Code's multi-agent advice to call `TaskGet` before every update and `TaskList` after every completion.
+- Tool descriptions and guidelines require independent task calls in one assistant message, including cleanup deletions. They distinguish sequential tool execution from a result dependency that requires another model turn, and ask for status updates as soon as work finishes.
 
 ## [0.1.0] - 2026-10-08
 

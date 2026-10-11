@@ -36,11 +36,13 @@ one response what would otherwise take several:
 - A call that starts a task while others are still `in_progress` lists them,
   so the model notices a task it forgot to complete. Nothing is blocked or
   changed.
-- The descriptions drop the advice that only pays off when several agents
-  share a list — read a task with `TaskGet` before every update, call
-  `TaskList` after every completion or before every creation — and instead ask
-  for related calls in the same response: several `TaskCreate` calls at once,
-  and completing one task together with starting the next.
+- The descriptions drop the advice to read a task before every update or list
+  tasks after every completion or before every creation. They require independent
+  task-tool calls in one assistant message, including creates, reads, updates and
+  cleanup deletions. Task tools execute sequentially; execution order alone does
+  not require another model turn. Wait only when a later call needs an earlier
+  result, such as a new task id. Complete a task and start the next with a known
+  id in the same message.
 
 ## `TaskCreate`
 

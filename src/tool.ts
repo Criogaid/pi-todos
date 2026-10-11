@@ -141,6 +141,9 @@ type TaskGetResult = Static<typeof TaskGetOutput>;
 type TaskListResult = Static<typeof TaskListOutput>;
 type TaskUpdateResult = Static<typeof TaskUpdateOutput>;
 
+const TASK_BATCHING_GUIDELINE =
+	"Batch independent task-tool calls in one assistant message. Start another model turn only when a later call must use an earlier result (for example, a new task ID). Task tools execute sequentially, so execution order alone does not require separate messages. This applies to creates, reads, updates, and cleanup deletions.";
+
 // Model-facing copy. Descriptions start from Claude Code's, without the teammate
 // sections. Advice that only pays off with several agents sharing a list
 // (re-reading before every update, TaskList after every completion) is replaced
@@ -183,7 +186,7 @@ NOTE that you should not use this tool if there is only one trivial task to do. 
 ## Tips
 
 - Create tasks with clear, specific subjects that describe the outcome
-- When you have several tasks to create, call TaskCreate once per task, all in the same response
+- Create one task per call. ${TASK_BATCHING_GUIDELINE}
 - Create the first task with \`status: "in_progress"\` instead of creating it and then updating it
 - To depend on tasks created in the same response, add the edges afterwards with TaskUpdate, once their IDs are known
 - You are the only one changing this list, and every result tells you what changed, so you don't need TaskList to check for duplicates`;
@@ -278,7 +281,11 @@ Use \`deleted\` to permanently remove a task.
 
 ## Batching
 
-You are the only one changing this list, so you don't need to call \`TaskGet\` before updating a task. Updates that belong together go in the same response: when you finish one task and start the next, send both TaskUpdate calls at once. If you start a task while others are still in_progress, the result lists them so you can mark the finished ones completed.
+You are the only one changing this list, so you don't need to call \`TaskGet\` before updating a task.
+
+${TASK_BATCHING_GUIDELINE}
+
+When you finish one task and start the next with a known ID, send both TaskUpdate calls in the same message. If you start a task while others are still in_progress, the result lists them so you can mark the finished ones completed.
 
 ## Examples
 
@@ -319,8 +326,8 @@ export const DEFAULT_GUIDANCE: Record<TaskToolName, Required<GuidanceFields>> = 
 		description: TASK_CREATE_DESCRIPTION,
 		promptSnippet: "Create a task in the session task list to plan and track multi-step work",
 		promptGuidelines: [
-			"Break down and manage your work with the TaskCreate and TaskUpdate tools. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.",
-			"Keep related task calls in one response: create all planned tasks with parallel TaskCreate calls (the first one can start as in_progress), and when you finish a task, mark it completed and start the next one in the same response.",
+			"Break down and manage your work with the TaskCreate and TaskUpdate tools. Mark each task completed when its work is done; do not postpone status updates until other work finishes.",
+			TASK_BATCHING_GUIDELINE,
 		],
 	},
 	[TASK_GET]: {
