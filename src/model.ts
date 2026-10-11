@@ -99,6 +99,13 @@ export function nextAvailableTask(state: TaskState): Task | undefined {
 	);
 }
 
+/** Ids of the other visible tasks that are in_progress, besides `id`. */
+export function otherTasksInProgress(state: TaskState, id: string): string[] {
+	return visibleTasks(state)
+		.filter((task) => task.id !== id && task.status === "in_progress")
+		.map((task) => task.id);
+}
+
 /** Shallow-merge `patch` into `base`; a `null` value removes that key. An empty result is `undefined`. */
 function mergeMetadata(
 	base: Record<string, unknown> | undefined,

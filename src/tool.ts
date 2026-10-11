@@ -31,6 +31,7 @@ import {
 	isRecord,
 	nextAvailableTask,
 	openBlockers,
+	otherTasksInProgress,
 	summarizeTasks,
 	TASK_NOT_FOUND,
 	TASK_STATUSES,
@@ -96,6 +97,7 @@ const IdsSchema = Type.Array(Type.String());
 
 export const TaskCreateOutput = Type.Object({
 	task: Type.Object({ id: Type.String(), subject: Type.String() }),
+	alsoInProgress: Type.Optional(IdsSchema),
 });
 
 export const TaskGetOutput = Type.Object({
@@ -131,6 +133,7 @@ export const TaskUpdateOutput = Type.Object({
 	error: Type.Optional(Type.String()),
 	statusChange: Type.Optional(Type.Object({ from: Type.String(), to: Type.String() })),
 	nextTask: Type.Optional(Type.Object({ id: Type.String(), subject: Type.String() })),
+	alsoInProgress: Type.Optional(IdsSchema),
 });
 
 type TaskCreateResult = Static<typeof TaskCreateOutput>;
@@ -275,7 +278,7 @@ Use \`deleted\` to permanently remove a task.
 
 ## Batching
 
-You are the only one changing this list, so you don't need to call \`TaskGet\` before updating a task. Updates that belong together go in the same response: when you finish one task and start the next, send both TaskUpdate calls at once.
+You are the only one changing this list, so you don't need to call \`TaskGet\` before updating a task. Updates that belong together go in the same response: when you finish one task and start the next, send both TaskUpdate calls at once. If you start a task while others are still in_progress, the result lists them so you can mark the finished ones completed.
 
 ## Examples
 
@@ -395,8 +398,9 @@ export function registerTaskTools(pi: ExtensionAPI, guidance: Guidance = {}): vo
 			const sessionId = sessionIdOf(ctx);
 			const { state, task } = createTask(getTaskState(sessionId), params);
 			commit(sessionId, state, toolCallId);
-			const output: TaskCreateResult = { task: { id: task.id, subject: task.subject } };
-			return textResult(formatCreated(task), output);
+			const hints = startHints(state, task.id, task.status);
+			const output: TaskCreateResult = { task: { id: task.id, subject: task.subject }, ...hints };
+			return textResult(formatCreated(task, hints), output);
 		},
 
 		renderCall(args, theme) {
@@ -499,9 +503,11 @@ export function registerTaskTools(pi: ExtensionAPI, guidance: Guidance = {}): vo
 			commit(sessionId, state, toolCallId);
 			const to = outcome.statusChange?.to;
 			const next = to === "completed" || to === "deleted" ? nextAvailableTask(state) : undefined;
-			if (!next) return textResult(formatUpdated(outcome), outcome);
-			const nextTask = { id: next.id, subject: next.subject };
-			return textResult(formatUpdated(outcome, nextTask), { ...outcome, nextTask });
+			const hints = {
+				...(next && { nextTask: { id: next.id, subject: next.subject } }),
+				...startHints(state, outcome.taskId, to),
+			};
+			return textResult(formatUpdated(outcome, hints), { ...outcome, ...hints });
 		},
 
 		renderCall(args, theme) {
@@ -519,6 +525,13 @@ export function registerTaskTools(pi: ExtensionAPI, guidance: Guidance = {}): vo
 			return new Text(theme.fg("success", `✓ #${outcome.taskId} ${change}`), 0, 0);
 		},
 	});
+}
+
+/** A task that just became in_progress reports the other tasks still in_progress; it does not stop them. */
+function startHints(state: TaskState, id: string, status: string | undefined): { alsoInProgress?: string[] } {
+	if (status !== "in_progress") return {};
+	const others = otherTasksInProgress(state, id);
+	return others.length > 0 ? { alsoInProgress: others } : {};
 }
 
 function title(name: string, theme: Theme): string {

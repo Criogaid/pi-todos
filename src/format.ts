@@ -3,7 +3,7 @@ import { countTasks, type Task, type TaskStatus, type TaskSummary, type UpdateOu
 import { sanitizeTerminalText } from "./sanitize.js";
 
 // Model-facing text. These strings match what Claude Code's task tools return,
-// except the next-available line, which is pi-todos' own.
+// except the next-available and also-in-progress lines, which are pi-todos' own.
 
 export const NO_TASKS_FOUND = "No tasks found";
 
@@ -11,8 +11,23 @@ function idList(ids: readonly string[]): string {
 	return ids.map((id) => `#${id}`).join(", ");
 }
 
-export function formatCreated(task: Task): string {
-	return `Task #${task.id} created successfully: ${task.subject}`;
+/** Hints appended to a write result, each on its own line. */
+export interface ResultHints {
+	/** The task to pick up next, after one was resolved. */
+	nextTask?: Pick<Task, "id" | "subject">;
+	/** Other tasks still in_progress, after one was started. */
+	alsoInProgress?: readonly string[];
+}
+
+function withHints(line: string, hints: ResultHints): string {
+	const lines = [line];
+	if (hints.nextTask) lines.push(formatNextAvailable(hints.nextTask));
+	if (hints.alsoInProgress?.length) lines.push(formatAlsoInProgress(hints.alsoInProgress));
+	return lines.join("\n");
+}
+
+export function formatCreated(task: Task, hints: ResultHints = {}): string {
+	return withHints(`Task #${task.id} created successfully: ${task.subject}`, hints);
 }
 
 export function formatTaskDetail(task: Task): string {
@@ -35,17 +50,20 @@ export function formatTaskList(summaries: readonly TaskSummary[]): string {
 
 /**
  * An update that changed nothing ends in a bare space, as Claude Code's does.
- * When the update resolved a task, a second line names the next available
- * task, so the model does not need a TaskList call to find it.
+ * Hints follow on their own lines: the next available task, so the model does
+ * not need a TaskList call to find it, and other tasks left in_progress.
  */
-export function formatUpdated(outcome: UpdateOutcome, nextTask?: Pick<Task, "id" | "subject">): string {
+export function formatUpdated(outcome: UpdateOutcome, hints: ResultHints = {}): string {
 	if (!outcome.success) return outcome.error ?? "";
-	const line = `Updated task #${outcome.taskId} ${outcome.updatedFields.join(", ")}`;
-	return nextTask ? `${line}\n${formatNextAvailable(nextTask)}` : line;
+	return withHints(`Updated task #${outcome.taskId} ${outcome.updatedFields.join(", ")}`, hints);
 }
 
 export function formatNextAvailable(task: Pick<Task, "id" | "subject">): string {
 	return `Next available task: #${task.id} ${task.subject}`;
+}
+
+export function formatAlsoInProgress(ids: readonly string[]): string {
+	return `Also in progress: ${idList(ids)}. Mark any that are done as completed.`;
 }
 
 // Terminal text. Task fields are model-controlled, so every field is sanitized.

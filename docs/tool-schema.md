@@ -33,6 +33,9 @@ one response what would otherwise take several:
   `TaskUpdate`.
 - A `TaskUpdate` that completes or deletes a task names the next available
   task, so the model does not need `TaskList` to find it.
+- A call that starts a task while others are still `in_progress` lists them,
+  so the model notices a task it forgot to complete. Nothing is blocked or
+  changed.
 - The descriptions drop the advice that only pays off when several agents
   share a list — read a task with `TaskGet` before every update, call
   `TaskList` after every completion or before every creation — and instead ask
@@ -57,7 +60,9 @@ Edges are recorded on both tasks, as `TaskUpdate` records them. Ids that do
 not exist yet are skipped, so a task cannot depend on one created later in the
 same response; add those edges with `TaskUpdate` once the ids are known.
 
-The model reads back `Task #<id> created successfully: <subject>`.
+The model reads back `Task #<id> created successfully: <subject>`. When the
+task is created `in_progress` and other tasks are `in_progress` too, a second
+line lists them: `Also in progress: #2, #5. Mark any that are done as completed.`
 
 ## `TaskGet`
 
@@ -139,7 +144,9 @@ Updated task #1 status
 Next available task: #2 Implement the fix
 ```
 
-The line is left out when no task is available.
+The line is left out when no task is available. When the call moves a task to
+`in_progress`, the `Also in progress` line described under `TaskCreate`
+follows instead if other tasks are `in_progress`.
 
 ## Argument repair
 
@@ -161,10 +168,10 @@ tools such as `codemode`, which hand it to scripts). Each tool declares the
 shape as its `outputSchema`:
 
 ```ts
-TaskCreate → { task: { id, subject } }
+TaskCreate → { task: { id, subject }, alsoInProgress?: string[] }
 TaskGet    → { task: { id, subject, description, status, blocks, blockedBy } | null }
 TaskList   → { tasks: Array<{ id, subject, status, owner?, blockedBy }> }
-TaskUpdate → { success, taskId, updatedFields, error?, statusChange?: { from, to }, nextTask?: { id, subject } }
+TaskUpdate → { success, taskId, updatedFields, error?, statusChange?: { from, to }, nextTask?: { id, subject }, alsoInProgress?: string[] }
 ```
 
 `TaskList` reports open blockers only, as in its text. An unknown id is not a
