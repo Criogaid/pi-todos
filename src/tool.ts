@@ -29,6 +29,7 @@ import {
 	createTask,
 	findTask,
 	isRecord,
+	nextAvailableTask,
 	openBlockers,
 	summarizeTasks,
 	TASK_NOT_FOUND,
@@ -57,6 +58,13 @@ export const TaskCreateParams = Type.Object({
 	subject: Type.String({ description: "A brief title for the task" }),
 	description: Type.String({ description: "What needs to be done" }),
 	activeForm: Type.Optional(ActiveFormSchema),
+	status: Type.Optional(
+		StringEnum(TASK_STATUSES, {
+			description: "Initial status. Defaults to pending; use in_progress for a task you start right away",
+		}),
+	),
+	addBlocks: Type.Optional(Type.Array(Type.String(), { description: "Existing task IDs that this task blocks" })),
+	addBlockedBy: Type.Optional(Type.Array(Type.String(), { description: "Existing task IDs that block this task" })),
 	metadata: Type.Optional({ ...MetadataSchema, description: "Arbitrary metadata to attach to the task" }),
 });
 
@@ -122,6 +130,7 @@ export const TaskUpdateOutput = Type.Object({
 	updatedFields: Type.Array(Type.String()),
 	error: Type.Optional(Type.String()),
 	statusChange: Type.Optional(Type.Object({ from: Type.String(), to: Type.String() })),
+	nextTask: Type.Optional(Type.Object({ id: Type.String(), subject: Type.String() })),
 });
 
 type TaskCreateResult = Static<typeof TaskCreateOutput>;
@@ -129,7 +138,10 @@ type TaskGetResult = Static<typeof TaskGetOutput>;
 type TaskListResult = Static<typeof TaskListOutput>;
 type TaskUpdateResult = Static<typeof TaskUpdateOutput>;
 
-// Model-facing copy. Descriptions are Claude Code's, without the teammate sections.
+// Model-facing copy. Descriptions start from Claude Code's, without the teammate
+// sections. Advice that only pays off with several agents sharing a list
+// (re-reading before every update, TaskList after every completion) is replaced
+// with guidance that keeps related calls in one response.
 
 export const TASK_CREATE_DESCRIPTION = `Use this tool to create a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
 It also helps the user understand the progress of the task and overall progress of their requests.
@@ -162,14 +174,16 @@ NOTE that you should not use this tool if there is only one trivial task to do. 
 - **subject**: A brief, actionable title in imperative form (e.g., "Fix authentication bug in login flow")
 - **description**: What needs to be done
 - **activeForm** (optional): Present continuous form shown in the spinner when the task is in_progress (e.g., "Fixing authentication bug"). If omitted, the spinner shows the subject instead.
-
-All tasks are created with status \`pending\`.
+- **status** (optional): Initial status. Tasks are created \`pending\` unless you pass \`in_progress\` for a task you are starting right away.
+- **addBlocks** / **addBlockedBy** (optional): Dependencies on tasks that already exist. IDs that do not exist yet are skipped.
 
 ## Tips
 
 - Create tasks with clear, specific subjects that describe the outcome
-- After creating tasks, use TaskUpdate to set up dependencies (blocks/blockedBy) if needed
-- Check TaskList first to avoid creating duplicate tasks`;
+- When you have several tasks to create, call TaskCreate once per task, all in the same response
+- Create the first task with \`status: "in_progress"\` instead of creating it and then updating it
+- To depend on tasks created in the same response, add the edges afterwards with TaskUpdate, once their IDs are known
+- You are the only one changing this list, and every result tells you what changed, so you don't need TaskList to check for duplicates`;
 
 export const TASK_GET_DESCRIPTION = `Use this tool to retrieve a task by its ID from the task list.
 
@@ -200,7 +214,8 @@ export const TASK_LIST_DESCRIPTION = `Use this tool to list all tasks in the tas
 - To see what tasks are available to work on (status: 'pending', no owner, not blocked)
 - To check overall progress on the project
 - To find tasks that are blocked and need dependencies resolved
-- After completing a task, to check for newly unblocked work or claim the next available task
+- When you have lost track of the list, for example after the conversation was compacted
+- You don't need it after completing a task: TaskUpdate already names the next available task
 - **Prefer working on tasks in ID order** (lowest ID first) when multiple tasks are available, as earlier tasks often set up context for later ones
 
 ## Output
@@ -222,7 +237,7 @@ export const TASK_UPDATE_DESCRIPTION = `Use this tool to update a task in the ta
 - When you have completed the work described in a task
 - When a task is no longer needed or has been superseded
 - IMPORTANT: Always mark your assigned tasks as resolved when you finish them
-- After resolving, call TaskList to find your next task
+- After resolving, the result names the next available task (pending, unowned, not blocked); you don't need to call TaskList to find it
 
 - ONLY mark a task as completed when you have FULLY accomplished it
 - If you encounter errors, blockers, or cannot finish, keep the task as in_progress
@@ -258,9 +273,9 @@ Status progresses: \`pending\` → \`in_progress\` → \`completed\`
 
 Use \`deleted\` to permanently remove a task.
 
-## Staleness
+## Batching
 
-Make sure to read a task's latest state using \`TaskGet\` before updating it.
+You are the only one changing this list, so you don't need to call \`TaskGet\` before updating a task. Updates that belong together go in the same response: when you finish one task and start the next, send both TaskUpdate calls at once.
 
 ## Examples
 
@@ -272,6 +287,12 @@ Mark task as in progress when starting work:
 Mark task as completed after finishing work:
 \`\`\`json
 {"taskId": "1", "status": "completed"}
+\`\`\`
+
+Finish one task and start the next, as two calls in the same response:
+\`\`\`json
+{"taskId": "1", "status": "completed"}
+{"taskId": "2", "status": "in_progress"}
 \`\`\`
 
 Delete a task:
@@ -296,6 +317,7 @@ export const DEFAULT_GUIDANCE: Record<TaskToolName, Required<GuidanceFields>> = 
 		promptSnippet: "Create a task in the session task list to plan and track multi-step work",
 		promptGuidelines: [
 			"Break down and manage your work with the TaskCreate and TaskUpdate tools. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.",
+			"Keep related task calls in one response: create all planned tasks with parallel TaskCreate calls (the first one can start as in_progress), and when you finish a task, mark it completed and start the next one in the same response.",
 		],
 	},
 	[TASK_GET]: {
@@ -473,8 +495,13 @@ export function registerTaskTools(pi: ExtensionAPI, guidance: Guidance = {}): vo
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const sessionId = sessionIdOf(ctx);
 			const { state, outcome } = updateTask(getTaskState(sessionId), params);
-			if (outcome.success) commit(sessionId, state, toolCallId);
-			return textResult(formatUpdated(outcome), outcome);
+			if (!outcome.success) return textResult(formatUpdated(outcome), outcome);
+			commit(sessionId, state, toolCallId);
+			const to = outcome.statusChange?.to;
+			const next = to === "completed" || to === "deleted" ? nextAvailableTask(state) : undefined;
+			if (!next) return textResult(formatUpdated(outcome), outcome);
+			const nextTask = { id: next.id, subject: next.subject };
+			return textResult(formatUpdated(outcome, nextTask), { ...outcome, nextTask });
 		},
 
 		renderCall(args, theme) {

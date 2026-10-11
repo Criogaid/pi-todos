@@ -89,6 +89,16 @@ export function summarizeTasks(state: TaskState): TaskSummary[] {
 	});
 }
 
+/**
+ * The task to pick up next: the lowest-id visible task that is pending, has no
+ * owner and no open blockers.
+ */
+export function nextAvailableTask(state: TaskState): Task | undefined {
+	return visibleTasks(state).find(
+		(task) => task.status === "pending" && task.owner === undefined && openBlockers(state, task).length === 0,
+	);
+}
+
 /** Shallow-merge `patch` into `base`; a `null` value removes that key. An empty result is `undefined`. */
 function mergeMetadata(
 	base: Record<string, unknown> | undefined,
@@ -110,10 +120,17 @@ export interface CreateTaskInput {
 	subject: string;
 	description: string;
 	activeForm?: string;
+	/** Initial status; `pending` when omitted. */
+	status?: TaskStatus;
+	addBlocks?: string[];
+	addBlockedBy?: string[];
 	metadata?: Record<string, unknown>;
 }
 
-/** Append a pending task with the next id. */
+/**
+ * Append a task with the next id. Edges to existing tasks are recorded on
+ * both sides, as `updateTask` records them; unknown ids are skipped.
+ */
 export function createTask(state: TaskState, input: CreateTaskInput): { state: TaskState; task: Task } {
 	const highWaterMark = state.highWaterMark + 1;
 	if (!Number.isSafeInteger(highWaterMark)) throw new Error("task id space exhausted");
@@ -121,14 +138,21 @@ export function createTask(state: TaskState, input: CreateTaskInput): { state: T
 		id: String(highWaterMark),
 		subject: input.subject,
 		description: input.description,
-		status: "pending",
+		status: input.status ?? "pending",
 		blocks: [],
 		blockedBy: [],
 	};
 	if (input.activeForm !== undefined) task.activeForm = input.activeForm;
 	const metadata = input.metadata && mergeMetadata(undefined, input.metadata);
 	if (metadata) task.metadata = metadata;
-	return { state: { tasks: [...state.tasks, task], highWaterMark }, task };
+	const created: TaskState = { tasks: [...state.tasks, task], highWaterMark };
+	if (!input.addBlocks?.length && !input.addBlockedBy?.length) return { state: created, task };
+	const linked = updateTask(created, {
+		taskId: task.id,
+		addBlocks: input.addBlocks,
+		addBlockedBy: input.addBlockedBy,
+	});
+	return { state: linked.state, task: findTask(linked.state, task.id)! };
 }
 
 export interface UpdateTaskInput {

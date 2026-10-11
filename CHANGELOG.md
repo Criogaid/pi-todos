@@ -22,6 +22,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Tool results carry `structuredContent` and declare an `outputSchema`, so `codemode` scripts receive structured output such as a new task's id.
 - Argument repair for `id`/`task_id` → `taskId`, `active_form` → `activeForm`, and ids written as numbers or with a leading `#`.
 - Claude Code's task reminder: a hidden message after 10 turns without `TaskCreate` or `TaskUpdate`. Disable it with `"taskReminder": false`.
+- `TaskCreate` takes optional `status`, `addBlocks` and `addBlockedBy`, so a task can start `in_progress` and depend on existing tasks in the same call.
+- A `TaskUpdate` that completes or deletes a task names the next available task in its text (`Next available task: #<id> <subject>`) and as `nextTask` in its structured output.
+- Tool descriptions and guidelines ask for related task calls in one response — parallel `TaskCreate` calls, and completing a task together with starting the next — and drop Claude Code's multi-agent advice to call `TaskGet` before every update and `TaskList` after every completion.
 
 ## [0.1.0] - 2026-10-08
 

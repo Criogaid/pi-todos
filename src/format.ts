@@ -2,7 +2,8 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { countTasks, type Task, type TaskStatus, type TaskSummary, type UpdateOutcome } from "./model.js";
 import { sanitizeTerminalText } from "./sanitize.js";
 
-// Model-facing text. These strings match what Claude Code's task tools return.
+// Model-facing text. These strings match what Claude Code's task tools return,
+// except the next-available line, which is pi-todos' own.
 
 export const NO_TASKS_FOUND = "No tasks found";
 
@@ -32,10 +33,19 @@ export function formatTaskList(summaries: readonly TaskSummary[]): string {
 	return summaries.length === 0 ? NO_TASKS_FOUND : summaries.map(formatSummaryLine).join("\n");
 }
 
-/** An update that changed nothing ends in a bare space, as Claude Code's does. */
-export function formatUpdated(outcome: UpdateOutcome): string {
+/**
+ * An update that changed nothing ends in a bare space, as Claude Code's does.
+ * When the update resolved a task, a second line names the next available
+ * task, so the model does not need a TaskList call to find it.
+ */
+export function formatUpdated(outcome: UpdateOutcome, nextTask?: Pick<Task, "id" | "subject">): string {
 	if (!outcome.success) return outcome.error ?? "";
-	return `Updated task #${outcome.taskId} ${outcome.updatedFields.join(", ")}`;
+	const line = `Updated task #${outcome.taskId} ${outcome.updatedFields.join(", ")}`;
+	return nextTask ? `${line}\n${formatNextAvailable(nextTask)}` : line;
+}
+
+export function formatNextAvailable(task: Pick<Task, "id" | "subject">): string {
+	return `Next available task: #${task.id} ${task.subject}`;
 }
 
 // Terminal text. Task fields are model-controlled, so every field is sanitized.

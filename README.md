@@ -65,6 +65,10 @@ by status.
   back by id, and changes only the fields it names; tasks can block each other
   and be deleted. Tool names, parameters, descriptions and the text the model
   reads back follow Claude Code, so models trained on it use them as intended.
+- **Fewer round trips.** The tools nudge the model to batch related calls into
+  one response, a task can be created already `in_progress` and with its
+  dependencies, and completing a task names the next one. See
+  [Differences from Claude Code](docs/tool-schema.md#differences-from-claude-code).
 - **Structured results.** Each tool also returns its output as
   `structuredContent`, so a `codemode` script gets the new task's id directly.
 - **The list survives `/reload` and compaction.** Each change saves the whole

@@ -3,13 +3,15 @@
 Parameters, results and persistence for the four task tools registered by
 [`pi-todos`](https://github.com/Criogaid/pi-todos): `TaskCreate`, `TaskGet`,
 `TaskList` and `TaskUpdate`. Names, parameters, descriptions and the text the
-model reads back follow Claude Code's task tools.
+model reads back follow Claude Code's task tools, except where
+[Differences from Claude Code](#differences-from-claude-code) says otherwise.
 
 ## Model
 
 The list is a set of tasks with ids. Each call reads or changes one task:
 
-- `TaskCreate` adds a `pending` task and returns its id.
+- `TaskCreate` adds a task, `pending` unless told otherwise, and returns its
+  id.
 - `TaskGet` returns one task in full.
 - `TaskList` returns a summary of every task.
 - `TaskUpdate` changes some fields of one task, adds dependency edges, or
@@ -21,6 +23,22 @@ never reused, not after a deletion and not after a finished list is cleared.
 Any status change is allowed, in any direction, and any number of tasks may be
 `in_progress` at once. Tasks are listed in creation order.
 
+## Differences from Claude Code
+
+The tools follow Claude Code's, with a few changes that let the model do in
+one response what would otherwise take several:
+
+- `TaskCreate` also takes `status`, `addBlocks` and `addBlockedBy`, so a task
+  can start `in_progress` and depend on existing tasks without a follow-up
+  `TaskUpdate`.
+- A `TaskUpdate` that completes or deletes a task names the next available
+  task, so the model does not need `TaskList` to find it.
+- The descriptions drop the advice that only pays off when several agents
+  share a list — read a task with `TaskGet` before every update, call
+  `TaskList` after every completion or before every creation — and instead ask
+  for related calls in the same response: several `TaskCreate` calls at once,
+  and completing one task together with starting the next.
+
 ## `TaskCreate`
 
 ```ts
@@ -28,9 +46,16 @@ TaskCreate({
   subject: string,                    // imperative title, e.g. "Run the test suite"
   description: string,                // what needs to be done
   activeForm?: string,                // shown while in_progress, e.g. "Running the test suite"
+  status?: "pending" | "in_progress" | "completed", // initial status, default "pending"
+  addBlocks?: string[],               // existing tasks that cannot start until this one completes
+  addBlockedBy?: string[],            // existing tasks that must complete before this one can start
   metadata?: Record<string, unknown>, // stored on the task
 })
 ```
+
+Edges are recorded on both tasks, as `TaskUpdate` records them. Ids that do
+not exist yet are skipped, so a task cannot depend on one created later in the
+same response; add those edges with `TaskUpdate` once the ids are known.
 
 The model reads back `Task #<id> created successfully: <subject>`.
 
@@ -105,6 +130,17 @@ changed fields in this order: `subject`, `description`, `activeForm`, `owner`,
 no fields: `Updated task #2 ` with a trailing space. A deletion reads
 `Updated task #2 deleted`, and an unknown id `Task not found`.
 
+When the call moves a task to `completed` or `deleted`, a second line names the
+next available task — the lowest-id visible task that is `pending`, has no
+owner and no open blockers:
+
+```
+Updated task #1 status
+Next available task: #2 Implement the fix
+```
+
+The line is left out when no task is available.
+
 ## Argument repair
 
 Before validation, the tools accept a few near misses, as Claude Code does:
@@ -128,7 +164,7 @@ shape as its `outputSchema`:
 TaskCreate → { task: { id, subject } }
 TaskGet    → { task: { id, subject, description, status, blocks, blockedBy } | null }
 TaskList   → { tasks: Array<{ id, subject, status, owner?, blockedBy }> }
-TaskUpdate → { success, taskId, updatedFields, error?, statusChange?: { from, to } }
+TaskUpdate → { success, taskId, updatedFields, error?, statusChange?: { from, to }, nextTask?: { id, subject } }
 ```
 
 `TaskList` reports open blockers only, as in its text. An unknown id is not a
