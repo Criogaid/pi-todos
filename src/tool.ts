@@ -142,7 +142,7 @@ type TaskListResult = Static<typeof TaskListOutput>;
 type TaskUpdateResult = Static<typeof TaskUpdateOutput>;
 
 const TASK_BATCHING_GUIDELINE =
-	"Submit independent task-tool calls together before reading any results. Use the available batch dispatcher (for example, multi_tool_use.parallel), or emit multiple calls in one assistant message. Do not call one tool, wait for its result, then send the next independent call. Start another model turn only when a later call needs an earlier result, such as a new task ID. Batch creates, reads, updates, and cleanup deletions.";
+	"MUST submit two or more ready, independent task-tool calls in one multi_tool_use.parallel request when that dispatcher is available. Otherwise, emit all calls in one assistant message before reading any result. NEVER call one tool, wait for its result, then submit the next independent call. Use a direct call when only one operation is ready. Keep calls that need earlier results sequential. This applies to creates, reads, updates, and cleanup deletions.";
 
 // Model-facing copy. Descriptions start from Claude Code's, without the teammate
 // sections. Advice that only pays off with several agents sharing a list

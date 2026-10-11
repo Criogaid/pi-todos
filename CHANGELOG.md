@@ -25,7 +25,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `TaskCreate` takes optional `status`, `addBlocks` and `addBlockedBy`, so a task can start `in_progress` and depend on existing tasks in the same call.
 - A `TaskUpdate` that completes or deletes a task names the next available task in its text (`Next available task: #<id> <subject>`) and as `nextTask` in its structured output.
 - Starting a task while others are still `in_progress` (with `TaskCreate` or `TaskUpdate`) lists them in the result (`Also in progress: #2, #5. …`) and as `alsoInProgress`. Nothing is blocked or changed.
-- Tool descriptions and guidelines require submitting independent task calls together before reading any results, using an available batch dispatcher or a message containing multiple calls. They explicitly reject sending the next independent call after receiving the previous result, cover cleanup deletions, and ask for status updates as soon as work finishes.
+- Tool descriptions and guidelines require two or more ready, independent task calls in one `multi_tool_use.parallel` request when available, or one assistant message otherwise. They forbid waiting between independent calls, cover cleanup deletions, and preserve sequential calls that need earlier results.
 
 ## [0.1.0] - 2026-10-08
 
