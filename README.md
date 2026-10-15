@@ -109,6 +109,8 @@ See [configuration](docs/configuration.md) for defaults and guidance overrides.
 Input limits and output budgets have one owner, [`LIMITS`](src/schema.ts).
 [The tool reference](docs/tool-schema.md#bounds) documents those values and
 continuation behavior. Change both together when adjusting the contract.
+Programmatic arrays must have an element at every index and no extra enumerable
+string keys; invalid inputs are rejected before any task changes are saved.
 
 ## Development and requirements
 

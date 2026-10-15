@@ -144,6 +144,15 @@ function assertJson(value: unknown, field: string, ancestors = new Set<object>()
 		Object.getPrototypeOf(value) !== null
 	)
 		throw new TaskError("invalid_input", field, "must contain only JSON objects and arrays");
+	if (Array.isArray(value)) {
+		const keys = Object.keys(value);
+		if (keys.length !== value.length || keys.some((key, index) => key !== String(index)))
+			throw new TaskError(
+				"invalid_input",
+				field,
+				"must contain arrays whose enumerable keys are exactly their indices",
+			);
+	}
 	ancestors.add(value);
 	for (const child of Object.values(value)) assertJson(child, field, ancestors);
 	ancestors.delete(value);

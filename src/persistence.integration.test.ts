@@ -241,6 +241,34 @@ describe("task persistence through the real Pi host", () => {
 		expect(h.snapshotCount()).toBe(1);
 		expect(await h.reload()).toEqual(before);
 	});
+	it("rejects non-JSON nested metadata arrays before saving and retains dense arrays after reopening", async () => {
+		const h = await setup();
+		await h.call("TaskWrite", createArgs("Saved"));
+		const before = structuredClone(h.state());
+		for (const values of [
+			new Array<string>(2),
+			Object.assign(["saved"], { extra: "lost" }),
+			Object.assign(new Array<string>(1), { extra: "lost" }),
+		]) {
+			const { outcomes } = await h.nested([
+				{
+					name: "TaskWrite",
+					args: {
+						operations: [
+							...createArgs("Rejected batch").operations,
+							{ action: "update", id: "1", set: { metadata: { values } } },
+						],
+					},
+				},
+			]);
+			expect(outcomes[0].isError).toBe(true);
+			expect(h.state()).toEqual(before);
+			expect(h.snapshotCount()).toBe(1);
+		}
+		const metadata = { values: [[], [null, null], ["saved", { nested: [] }]] };
+		expect((await h.call("TaskWrite", updateArgs("1", { metadata }))).isError).toBe(false);
+		expect((await h.reload()).tasks[0].metadata).toEqual(metadata);
+	});
 	it("cleans deleted dependencies and retains completed work across a new run", async () => {
 		const h = await setup();
 		await h.call("TaskWrite", createArgs("First"));

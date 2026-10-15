@@ -129,6 +129,35 @@ describe("strict arguments without coercion", () => {
 		{ view: "summary", afterId: 2 },
 		{ taskId: "1" },
 	])("rejects invalid read %j", (value) => expect(() => parseRead(value)).toThrow());
+	it.each([
+		{ name: "sparse array", values: new Array<string>(2) },
+		{ name: "array with extra keys", values: Object.assign(["saved"], { extra: "lost" }) },
+		{ name: "array hole balanced by an extra key", values: Object.assign(new Array<string>(1), { extra: "lost" }) },
+	])("rejects a $name in nested metadata without saving or publishing a batch", async ({ values }) => {
+		const { execute, pi } = setup();
+		await execute("TaskWrite", create);
+		const before = getTaskState("test-session");
+		await expect(
+			execute("TaskWrite", {
+				operations: [
+					...create.operations,
+					{ action: "update", id: "1", set: { metadata: { nested: { values } } } },
+				],
+			}),
+		).rejects.toMatchObject({ code: "invalid_input" });
+		expect(getTaskState("test-session")).toBe(before);
+		expect(pi.appendEntry).toHaveBeenCalledTimes(1);
+	});
+	it("preserves dense metadata arrays including empty arrays and explicit nulls across JSON snapshots", async () => {
+		const { execute, pi } = setup();
+		const metadata = { values: [[], [null, null], ["saved", true, 3, { nested: [] }]] };
+		await execute("TaskWrite", {
+			operations: [{ action: "create", task: { subject: "Arrays", description: "Keep metadata", metadata } }],
+		});
+		const snapshot = vi.mocked(pi.appendEntry).mock.calls[0][1];
+		expect(decodeSnapshot(JSON.parse(JSON.stringify(snapshot)))).toEqual(getTaskState("test-session"));
+		expect(getTaskState("test-session").tasks[0].metadata).toEqual(metadata);
+	});
 	it("rejects cyclic metadata without recursion failure", () => {
 		const value: { nested?: unknown } = {};
 		value.nested = value;

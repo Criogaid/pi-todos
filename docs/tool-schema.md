@@ -131,6 +131,9 @@ spaces, leading zeroes, or numeric coercion. Allocation stops at the largest
 safe integer. Input with unknown fields or another argument shape is rejected
 before the host can coerce it. Programmatic inputs must also be JSON values;
 explicit `undefined`, non-finite numbers, functions, and cycles are rejected.
+Array indices must all be present and enumerable, with no extra enumerable string
+keys. Empty arrays and explicit `null` elements are valid. Invalid array shapes
+reject the entire input before execution.
 
 ## Errors and structured output
 
