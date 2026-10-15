@@ -1,16 +1,38 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { findPackageJSON } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { JsonObject } from "@earendil-works/pi-ai";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-// These integration tests exercise the actual pinned host pipeline, not just execute().
-import {
+
+// The same contract probes can exercise an installed host without changing dependencies.
+const hostRoot =
+	process.env.PI_TODOS_TEST_HOST_ROOT ??
+	fileURLToPath(new URL("../node_modules/@earendil-works/pi-coding-agent", import.meta.url));
+const corePackage = findPackageJSON(
+	"@earendil-works/pi-agent-core",
+	pathToFileURL(join(resolve(hostRoot), "package.json")),
+);
+if (!corePackage) throw new Error("Selected host has no pi-agent-core package");
+const hostUrl = (path: string) => pathToFileURL(join(hostRoot, path)).href;
+// These typed boundaries deliberately require the selected host to implement the checked API.
+const { SessionManager }: typeof import("@earendil-works/pi-coding-agent") = await import(hostUrl("dist/index.js"));
+const {
 	NESTED_CALL_LIMITS,
 	NestedToolCallRunner,
-} from "../node_modules/@earendil-works/pi-coding-agent/dist/core/nested-tool-calls.js";
-import { wrapToolDefinition } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/tool-definition-wrapper.js";
-import { runToolCall } from "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js";
+}: typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/nested-tool-calls.js") = await import(
+	hostUrl("dist/core/nested-tool-calls.js")
+);
+const {
+	wrapToolDefinition,
+}: typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/tool-definition-wrapper.js") =
+	await import(hostUrl("dist/core/tools/tool-definition-wrapper.js"));
+const {
+	runToolCall,
+}: typeof import("../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js") =
+	await import(pathToFileURL(join(dirname(corePackage), "dist/agent-loop.js")).href);
+
 import {
 	createMockCtx,
 	createMockPi,
@@ -129,177 +151,143 @@ async function setup() {
 function createdId(outcome: Awaited<ReturnType<typeof runToolCall>>): string {
 	expect(outcome.isError).toBe(false);
 	const output = outcome.result.structuredContent;
-	if (!isRecord(output) || !isRecord(output.task) || typeof output.task.id !== "string")
+	if (
+		!isRecord(output) ||
+		!Array.isArray(output.outcomes) ||
+		!isRecord(output.outcomes[0]) ||
+		typeof output.outcomes[0].id !== "string"
+	)
 		throw new Error("missing structured task id");
-	return output.task.id;
+	return output.outcomes[0].id;
 }
+const createArgs = (subject: string, description = "Requirements") => ({
+	operations: [{ action: "create", task: { subject, description } }],
+});
+const updateArgs = (id: string, set: JsonObject) => ({ operations: [{ action: "update", id, set }] });
 
 describe("task persistence through the real Pi host", () => {
-	it("creates, repairs and updates direct calls before restoring tasks from disk", async () => {
-		const harness = await setup();
-		const id = createdId(
-			await harness.call("TaskCreate", {
-				subject: "  Build  ",
-				description: "Details",
-				active_form: "Building",
-				metadata: { keep: true, removed: null },
-			}),
-		);
-		const update = await harness.call("TaskUpdate", { task_id: ` #${id} `, status: "in_progress", owner: "agent" });
-		expect(update.isError).toBe(false);
-		expect(update.result.structuredContent).toMatchObject({
-			success: true,
-			taskId: id,
-			updatedFields: ["owner", "status"],
+	it("runs direct atomic batches and reads through provider argument validation", async () => {
+		const h = await setup();
+		const id = createdId(await h.call("TaskWrite", createArgs("Build")));
+		const result = await h.call("TaskWrite", {
+			operations: [
+				{ action: "update", id, set: { status: "completed", progress: "Verified" } },
+				{ action: "create", task: { subject: "Next", description: "Requirements", status: "in_progress" } },
+			],
 		});
-		const get = await harness.call("TaskGet", { id: Number(id) });
-		expect(get.isError).toBe(false);
-		expect(get.result.structuredContent).toMatchObject({ task: { id, subject: "  Build  ", status: "in_progress" } });
-		const before = structuredClone(harness.state());
-		expect(before.tasks[0]).toMatchObject({ activeForm: "Building", metadata: { keep: true }, owner: "agent" });
-		expect(await harness.reload()).toEqual(before);
-	});
-
-	it("runs TaskCreate and TaskUpdate as codemode subcalls with structured results", async () => {
-		const harness = await setup();
-		const create = await harness.nested([
-			{ name: "TaskCreate", args: { subject: "Nested task", description: "Details" } },
-		]);
-		const id = createdId(create.outcomes[0]);
-		const update = await harness.nested([
-			{ name: "TaskUpdate", args: { id: Number(id), status: "completed" } },
-			{ name: "TaskGet", args: { taskId: `#${id}` } },
-			{ name: "TaskList", args: {} },
-		]);
-		expect(update.outcomes.every((outcome) => !outcome.isError)).toBe(true);
-		expect(update.outcomes[0].result.structuredContent).toMatchObject({
-			success: true,
-			taskId: id,
-			statusChange: { from: "pending", to: "completed" },
+		expect(result.isError).toBe(false);
+		const read = await h.call("TaskRead", { view: "details", ids: [id] });
+		expect(read.result.structuredContent).toMatchObject({
+			tasks: [{ id, status: "completed", progress: "Verified" }],
 		});
-		expect(harness.snapshotCount()).toBe(2);
-		const before = structuredClone(harness.state());
-		expect(await harness.reload()).toEqual(before);
+		expect(h.snapshotCount()).toBe(2);
+		const state = structuredClone(h.state());
+		expect(await h.reload()).toEqual(state);
 	});
-
-	it("preserves tasks when the host omits oversized nested arguments", async () => {
-		const harness = await setup();
-		const description = "x".repeat(NESTED_CALL_LIMITS.maxArgumentBytesPerCall + 1);
-		const { outcomes, nestedCalls } = await harness.nested([
-			{ name: "TaskCreate", args: { subject: "Large description", description } },
-			{ name: "TaskUpdate", args: { taskId: "1", status: "completed" } },
+	it("runs nested tools with structured results and restores snapshots when wrapper diagnostics omit arguments", async () => {
+		const h = await setup();
+		const description = "x".repeat(NESTED_CALL_LIMITS.maxArgumentBytesPerCall / 2);
+		const args = {
+			operations: [
+				{
+					action: "create",
+					task: { subject: "Nested", description, metadata: { extra: "y".repeat(description.length) } },
+				},
+			],
+		};
+		const { outcomes, nestedCalls } = await h.nested([
+			{ name: "TaskWrite", args },
+			{ name: "TaskRead", args: {} },
 		]);
-		expect(outcomes.every((outcome) => !outcome.isError)).toBe(true);
+		createdId(outcomes[0]);
 		expect(nestedCalls?.calls[0]?.arguments).toBeUndefined();
-		const restored = await harness.reload();
-		expect(restored.highWaterMark).toBe(1);
-		expect(restored.tasks[0]).toMatchObject({ description, status: "completed" });
+		const before = structuredClone(h.state());
+		expect(await h.reload()).toEqual(before);
 	});
-
-	it("preserves updates dropped from the host's nested-call record", async () => {
-		const harness = await setup();
-		const calls = Array.from({ length: NESTED_CALL_LIMITS.maxCalls + 1 }, (_, index) => ({
-			name: "TaskCreate",
-			args: { subject: `Task ${index}`, description: "" },
+	it("preserves writes omitted from the bounded nested-call record", async () => {
+		const h = await setup();
+		const calls = Array.from({ length: NESTED_CALL_LIMITS.maxCalls + 1 }, (_, i) => ({
+			name: "TaskWrite",
+			args: createArgs(`Task ${i}`),
 		}));
-		const { outcomes, nestedCalls } = await harness.nested(calls);
+		const { outcomes, nestedCalls } = await h.nested(calls);
 		expect(outcomes.every((outcome) => !outcome.isError)).toBe(true);
 		expect(nestedCalls?.calls.length).toBeLessThan(outcomes.length);
-		const restored = await harness.reload();
-		expect(restored.tasks).toHaveLength(calls.length);
-		expect(restored.highWaterMark).toBe(calls.length);
+		expect((await h.reload()).tasks).toHaveLength(calls.length);
 	});
-
-	it("allocates unique ids for concurrent nested creates", async () => {
-		const harness = await setup();
-		const { outcomes } = await harness.nested(
-			["First", "Second", "Third", "Fourth"].map((subject) => ({
-				name: "TaskCreate",
-				args: { subject, description: "" },
-			})),
+	it("serializes concurrent nested writes and retains a write when its wrapper fails", async () => {
+		const h = await setup();
+		const { outcomes } = await h.nested(
+			["A", "B", "C"].map((subject) => ({ name: "TaskWrite", args: createArgs(subject) })),
+			true,
 			true,
 		);
-		const ids = outcomes.map(createdId);
-		expect(new Set(ids).size).toBe(4);
-		expect(harness.state().highWaterMark).toBe(4);
-		expect((await harness.reload()).tasks.map((task) => task.id)).toEqual(ids);
+		expect(new Set(outcomes.map(createdId)).size).toBe(3);
+		expect((await h.reload()).tasks).toHaveLength(3);
 	});
-
-	it("does not write snapshots for reads, missing updates or invalid arguments", async () => {
-		const harness = await setup();
-		await harness.call("TaskCreate", { subject: "Task", description: "" });
-		const before = structuredClone(harness.state());
-		await harness.call("TaskGet", { taskId: "1" });
-		await harness.call("TaskList");
-		const missing = await harness.call("TaskUpdate", { taskId: "99", status: "completed" });
-		expect(missing.isError).toBe(false);
-		expect(missing.result.structuredContent).toMatchObject({ success: false, error: "Task not found" });
-		const invalid = await harness.call("TaskUpdate", { taskId: "1", status: "invalid" });
-		expect(invalid.isError).toBe(true);
-		expect(harness.snapshotCount()).toBe(1);
-		expect(await harness.reload()).toEqual(before);
+	it("rejects numeric IDs, old names, unknown fields, and failed batches without snapshots", async () => {
+		const h = await setup();
+		await h.call("TaskWrite", createArgs("Saved"));
+		const before = structuredClone(h.state());
+		for (const [name, args] of [
+			["TaskCreate", { subject: "Old", description: "Old" }],
+			["TaskWrite", { operations: [{ action: "update", id: 1, set: {} }] }],
+			["TaskWrite", { operations: [{ action: "update", id: "1", set: { addBlockedBy: [] } }] }],
+			["TaskWrite", { operations: [...createArgs("Rolled back").operations, { action: "delete", id: "99" }] }],
+		] satisfies [string, JsonObject][])
+			expect((await h.call(name, args)).isError).toBe(true);
+		await h.call("TaskRead");
+		await h.call("TaskWrite", updateArgs("1", {}));
+		expect(h.snapshotCount()).toBe(1);
+		expect(await h.reload()).toEqual(before);
 	});
-
-	it("keeps a successful nested write if the wrapper subsequently fails", async () => {
-		const harness = await setup();
-		const { outcomes } = await harness.nested(
-			[{ name: "TaskCreate", args: { subject: "Saved", description: "" } }],
-			false,
-			true,
-		);
-		createdId(outcomes[0]);
-		expect((await harness.reload()).tasks[0].subject).toBe("Saved");
+	it("cleans deleted dependencies and retains completed work across a new run", async () => {
+		const h = await setup();
+		await h.call("TaskWrite", createArgs("First"));
+		await h.call("TaskWrite", createArgs("Second"));
+		await h.call("TaskWrite", updateArgs("2", { dependsOn: ["1"] }));
+		await h.call("TaskWrite", {
+			operations: [
+				{ action: "delete", id: "1" },
+				{ action: "update", id: "2", set: { status: "completed" } },
+			],
+		});
+		await h.emit("agent_start", {});
+		const restored = await h.reload();
+		expect(restored.tasks).toMatchObject([{ id: "2", status: "completed", dependsOn: [] }]);
+		expect(createdId(await h.call("TaskWrite", createArgs("Third")))).toBe("3");
 	});
-
-	it("restores deletion cleanup and retains the high-water mark after reload", async () => {
-		const harness = await setup();
-		await harness.call("TaskCreate", { subject: "First", description: "" });
-		await harness.call("TaskCreate", { subject: "Second", description: "" });
-		await harness.call("TaskUpdate", { taskId: "1", addBlocks: [2] });
-		await harness.call("TaskUpdate", { taskId: "1", status: "deleted" });
-		const restored = await harness.reload();
-		expect(restored.tasks.map((task) => task.id)).toEqual(["2"]);
-		expect(restored.tasks[0].blockedBy).toEqual([]);
-		expect(restored.highWaterMark).toBe(2);
-		expect(createdId(await harness.call("TaskCreate", { subject: "Third", description: "" }))).toBe("3");
-	});
-
-	it("persists automatic clearing without reusing completed task ids", async () => {
-		const harness = await setup();
-		await harness.call("TaskCreate", { subject: "First", description: "" });
-		await harness.call("TaskUpdate", { taskId: "1", status: "completed" });
-		await harness.emit("agent_start", {});
-		const cleared = await harness.reload();
-		expect(cleared.tasks).toEqual([]);
-		expect(cleared.highWaterMark).toBe(1);
-		expect(createdId(await harness.call("TaskCreate", { subject: "Next", description: "" }))).toBe("2");
-	});
-
-	it("restores the selected branch and survives a real compaction entry", async () => {
-		const harness = await setup();
-		await harness.call("TaskCreate", { subject: "First", description: "" });
-		const firstLeaf = harness.manager().getLeafId();
+	it("restores the selected branch and survives real compaction", async () => {
+		const h = await setup();
+		await h.call("TaskWrite", createArgs("First"));
+		const firstLeaf = h.manager().getLeafId();
 		if (!firstLeaf) throw new Error("missing branch point");
-		await harness.call("TaskCreate", { subject: "Abandoned", description: "" });
-		harness.manager().branch(firstLeaf);
-		await harness.emit("session_tree", {});
-		expect(harness.state().tasks.map((task) => task.subject)).toEqual(["First"]);
-		expect(harness.state().highWaterMark).toBe(1);
-		await harness.call("TaskCreate", { subject: "New branch", description: "" });
-		const before = structuredClone(harness.state());
-		harness.manager().appendCompaction("Summary", harness.manager().getLeafId(), 100);
-		await harness.emit("session_compact", {});
-		expect(harness.state()).toEqual(before);
-		expect(await harness.reload()).toEqual(before);
+		await h.call("TaskWrite", createArgs("Abandoned"));
+		h.manager().branch(firstLeaf);
+		await h.emit("session_tree", {});
+		expect(h.state().tasks.map((task) => task.subject)).toEqual(["First"]);
+		await h.call("TaskWrite", createArgs("New branch"));
+		const before = structuredClone(h.state());
+		h.manager().appendCompaction("Summary", h.manager().getLeafId(), 100);
+		await h.emit("session_compact", {});
+		expect(await h.reload()).toEqual(before);
 	});
-
-	it("keeps disk snapshots isolated across two sessions", async () => {
+	it("keeps disk snapshots isolated across sessions", async () => {
 		const first = await setup();
 		const second = await setup();
-		await first.call("TaskCreate", { subject: "First session", description: "" });
-		await second.call("TaskCreate", { subject: "Second session", description: "" });
+		await first.call("TaskWrite", createArgs("First session"));
+		await second.call("TaskWrite", createArgs("Second session"));
 		expect((await first.reload()).tasks[0].subject).toBe("First session");
 		expect((await second.reload()).tasks[0].subject).toBe("Second session");
 		expect(first.state().tasks[0].subject).toBe("First session");
 	});
+});
+
+it("preserves status during progress updates and clears optional fields through host validation", async () => {
+	const h = await setup();
+	await h.call("TaskWrite", createArgs("Task"));
+	await h.call("TaskWrite", updateArgs("1", { status: "in_progress", owner: "agent", metadata: { keep: null } }));
+	await h.call("TaskWrite", updateArgs("1", { progress: "Checked", owner: null }));
+	expect(h.state().tasks[0]).toMatchObject({ status: "in_progress", progress: "Checked", metadata: { keep: null } });
+	expect(h.state().tasks[0]).not.toHaveProperty("owner");
 });

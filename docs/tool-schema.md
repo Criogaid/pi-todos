@@ -1,221 +1,174 @@
-# Task tools reference
+# Task tools
 
-Parameters, results and persistence for the four task tools registered by
-[`pi-todos`](https://github.com/Criogaid/pi-todos): `TaskCreate`, `TaskGet`,
-`TaskList` and `TaskUpdate`. Names, parameters, descriptions and the text the
-model reads back follow Claude Code's task tools, except where
-[Differences from Claude Code](#differences-from-claude-code) says otherwise.
+`TaskRead` and `TaskWrite` operate on one session-local state. Their schemas,
+result shapes, and limits live in [`schema.ts`](../src/schema.ts); domain
+transitions and shared selectors live in [`model.ts`](../src/model.ts).
 
-## Model
+## Task model
 
-The list is a set of tasks with ids. Each call reads or changes one task:
+| Field | Meaning |
+| --- | --- |
+| `id` | Assigned positive decimal string. Stable within branch history; deletion never resets allocation. |
+| `subject` | Required outcome title. |
+| `description` | Required requirements, constraints, and completion criteria. |
+| `progress` | Optional replaceable checkpoint with findings and next action. |
+| `status` | `pending`, `in_progress`, or `completed`. Creation defaults to pending. |
+| `dependsOn` | Prerequisite IDs, stored only on the dependent task. Defaults to an empty array on creation. |
+| `owner` | Optional assignment label, with no locking or subagent authority. |
+| `activeForm` | Optional display label while in progress. |
+| `metadata` | Optional JSON object. No key has visibility or scheduling semantics. |
 
-- `TaskCreate` adds a task, `pending` unless told otherwise, and returns its
-  id.
-- `TaskGet` returns one task in full.
-- `TaskList` returns a summary of every task.
-- `TaskUpdate` changes some fields of one task, adds dependency edges, or
-  deletes the task.
+All text fields require a non-whitespace character. Optional fields may be
+cleared with `null`; omitted fields remain unchanged. Arrays and metadata are
+replaced as a whole. A `null` value inside metadata is ordinary data.
 
-Ids are decimal strings assigned in order: `"1"`, `"2"`, `"3"`, … An id is
-never reused, not after a deletion and not after a finished list is cleared.
+All status transitions are allowed. Dependencies do not enforce starting order.
+A prerequisite becoming completed stops blocking its dependents; reopening it
+restores the blocker without reopening those dependents. Every view derives
+`blockedBy` from unfinished prerequisites. The complete relation remains
+available as `dependsOn` in task details.
 
-Any status change is allowed, in any direction, and any number of tasks may be
-`in_progress` at once. Tasks are listed in creation order.
-
-## Differences from Claude Code
-
-The tools follow Claude Code's, with a few changes that let the model do in
-one response what would otherwise take several:
-
-- `TaskCreate` also takes `status`, `addBlocks` and `addBlockedBy`, so a task
-  can start `in_progress` and depend on existing tasks without a follow-up
-  `TaskUpdate`.
-- A `TaskUpdate` that completes or deletes a task names the next available
-  task, so the model does not need `TaskList` to find it.
-- A call that starts a task while others are still `in_progress` lists them,
-  so the model notices a task it forgot to complete. Nothing is blocked or
-  changed.
-- The descriptions drop the advice to read a task before every update or list
-  tasks after every completion or before every creation. They require two or
-  more ready, independent task-tool calls in one `multi_tool_use.parallel`
-  request when that dispatcher is available. Otherwise, emit all calls in one
-  assistant message before reading any result. This includes creates, reads,
-  updates and cleanup deletions. Sending one call, waiting for its result, then
-  sending the next independent call is forbidden. Use a direct call for one
-  ready operation; keep calls that need earlier results sequential. Complete a
-  task and start the next with a known id in the same batch.
-
-## `TaskCreate`
+## TaskWrite
 
 ```ts
-TaskCreate({
-  subject: string,                    // imperative title, e.g. "Run the test suite"
-  description: string,                // what needs to be done
-  activeForm?: string,                // shown while in_progress, e.g. "Running the test suite"
-  status?: "pending" | "in_progress" | "completed", // initial status, default "pending"
-  addBlocks?: string[],               // existing tasks that cannot start until this one completes
-  addBlockedBy?: string[],            // existing tasks that must complete before this one can start
-  metadata?: Record<string, unknown>, // stored on the task
+TaskWrite({
+  operations: [
+    { action: "update", id: "1", set: { status: "completed", progress: "Checks passed" } },
+    { action: "update", id: "2", set: { status: "in_progress", dependsOn: ["1"] } },
+    { action: "create", task: { subject: "Investigate the new issue", description: "Identify the cause" } }
+  ]
 })
 ```
 
-Edges are recorded on both tasks, as `TaskUpdate` records them. Ids that do
-not exist yet are skipped, so a task cannot depend on one created later in the
-same response; add those edges with `TaskUpdate` once the ids are known.
+One operation uses the same array shape. `create.task` requires subject and
+description and accepts the remaining editable fields. `update.set` accepts
+any subset of editable fields, including an empty no-op object. `delete`
+requires only `id`; it removes the task and references to it. Deletion does not
+mean completion.
 
-The model reads back `Task #<id> created successfully: <subject>`. When the
-task is created `in_progress` and other tasks are `in_progress` too, a second
-line lists them: `Also in progress: #2, #5. Mark any that are done as completed.`
+Operations execute in order on an unpublished candidate. IDs referenced anywhere
+must already exist before the request; obtain new IDs from the result before
+linking new tasks. Updating a task after deleting it fails. A final dependency
+graph with missing IDs, self-dependencies, or a cycle rejects the whole batch.
+Intermediate graph cycles are allowed if later operations resolve them.
 
-## `TaskGet`
-
-```ts
-TaskGet({ taskId: string })
-```
-
-The model reads back:
-
-```
-Task #2: Implement the fix
-Status: in_progress
-Description: Patch the parser so empty input no longer throws
-Blocked by: #1
-Blocks: #3
-```
-
-The `Blocked by` and `Blocks` lines appear only when they are non-empty, and
-they list every edge, open or not. An unknown id answers `Task not found`.
-
-## `TaskList`
+A changed candidate is saved once before publication. Rejected batches publish
+nothing and allocate no IDs. A batch with no net state change saves no snapshot.
+Evaluation, append, and publication run synchronously without an await between
+them, including inside concurrent nested calls.
 
 ```ts
-TaskList({})
+{
+  ok: true,
+  changed: boolean,
+  outcomes: Array<{ action: "create" | "update" | "delete", id: string, changed: boolean }>,
+  active: SummaryPage,
+  nextReady?: TaskSummary
+}
 ```
 
-One line per task, in creation order:
+Outcomes correspond to operations in input order. Their `changed` flags describe
+each operation; the top-level flag describes the net change. Hints come only from
+the final state. `nextReady` is the first pending, unowned task without current
+blockers. It is a suggestion, not a reservation or scheduling constraint.
 
-```
-#1 [completed] Reproduce the issue
-#2 [in_progress] Implement the fix (alice)
-#3 [pending] Verify the result [blocked by #2]
-```
-
-The owner appears in parentheses when it is set. `blocked by` lists only
-blockers that still exist and are not completed. An empty list answers
-`No tasks found`.
-
-Tasks whose `metadata._internal` is `true` are left out, as they are from the
-overlay and `/tasks`.
-
-## `TaskUpdate`
+## TaskRead
 
 ```ts
-TaskUpdate({
-  taskId: string,
-  subject?: string,
-  description?: string,
-  activeForm?: string,
-  status?: "pending" | "in_progress" | "completed" | "deleted",
-  addBlocks?: string[],                // tasks that cannot start until this one completes
-  addBlockedBy?: string[],             // tasks that must complete before this one can start
-  owner?: string,
-  metadata?: Record<string, unknown>,  // merged; a null value deletes that key
-})
+TaskRead({})
+TaskRead({ view: "summary", scope: "all", afterId: "20" })
+TaskRead({ view: "details", ids: ["1", "2"] })
 ```
 
-- A field is applied, and reported, only when its value differs from the
-  current one. `metadata` is the exception: it is merged key by key and always
-  reported when given.
-- `addBlocks` and `addBlockedBy` only add edges. Each edge is recorded on both
-  tasks: `addBlocks: ["3"]` on task 2 also adds `2` to task 3's `blockedBy`.
-  Unknown ids, the task's own id and edges that already exist are skipped.
-- `status: "deleted"` removes the task and every edge that points at it; other
-  fields in the same call are ignored.
+Summary is the default. `scope` defaults to `active` (unfinished tasks); `all`
+includes completed tasks. Tasks are ordered by numeric creation ID. `afterId`
+is an exclusive cursor, so a deleted task can still be used as a cursor. A page
+reports total matching tasks and the number remaining after that page. Follow
+`nextAfterId` with the same scope while tasks remain omitted.
 
-The model reads back `Updated task #<id> <fields>`, where `<fields>` lists the
-changed fields in this order: `subject`, `description`, `activeForm`, `owner`,
-`metadata`, `status`, `blocks`, `blockedBy`. A call that changes nothing lists
-no fields: `Updated task #2 ` with a trailing space. A deletion reads
-`Updated task #2 deleted`, and an unknown id `Task not found`.
-
-When the call moves a task to `completed` or `deleted`, a second line names the
-next available task — the lowest-id visible task that is `pending`, has no
-owner and no open blockers:
-
-```
-Updated task #1 status
-Next available task: #2 Implement the fix
-```
-
-The line is left out when no task is available. When the call moves a task to
-`in_progress`, the `Also in progress` line described under `TaskCreate`
-follows instead if other tasks are `in_progress`.
-
-## Argument repair
-
-Before validation, the tools accept a few near misses, as Claude Code does:
-
-- `id` or `task_id` is read as `taskId`, and `active_form` as `activeForm`;
-- a task id may be written `3`, `"#3"` or `" 3 "`, in `taskId`, `addBlocks`
-  and `addBlockedBy`.
-
-Pi then converts arguments to the schema's declared types and validates them;
-a call that still does not match fails with the host's validation error and
-changes nothing.
-
-## Results
-
-Every result carries the text above in `content`, plus the same structured
-output in `details` (for the renderers) and `structuredContent` (for wrapper
-tools such as `codemode`, which hand it to scripts). Each tool declares the
-shape as its `outputSchema`:
+Details requires `ids` and forbids `scope` and `afterId`. It returns complete
+stored tasks plus current `blockedBy`, in requested order. To stay within the
+output budget, it may return only a prefix of the requested tasks. Follow
+`nextIds` in another details request. It never silently truncates stored fields.
+Any unknown selected ID rejects the request without returning partial details.
 
 ```ts
-TaskCreate → { task: { id, subject }, alsoInProgress?: string[] }
-TaskGet    → { task: { id, subject, description, status, blocks, blockedBy } | null }
-TaskList   → { tasks: Array<{ id, subject, status, owner?, blockedBy }> }
-TaskUpdate → { success, taskId, updatedFields, error?, statusChange?: { from, to }, nextTask?: { id, subject }, alsoInProgress?: string[] }
+type TaskSummary = { id: string, subject: string, status: string, owner?: string, blockedBy: string[] };
+type SummaryPage = {
+  ok: true, view: "summary", scope: "active" | "all",
+  tasks: TaskSummary[], total: number, omitted: number, nextAfterId?: string
+};
+type DetailPage = { ok: true, view: "details", tasks: TaskDetail[], nextIds: string[] };
 ```
 
-`TaskList` reports open blockers only, as in its text. An unknown id is not a
-failed tool call: `TaskGet` returns `task: null`, and `TaskUpdate` returns
-`success: false` with `error: "Task not found"`.
+## Bounds
 
-## Persistence and replay
+These are safety and attention budgets, not configuration options. Update
+[`LIMITS`](../src/schema.ts), this section, and the linked README together.
+JSON serialization budgets use JavaScript string length (UTF-16 units); text
+schema bounds and context field shortening count Unicode code points.
 
-Each successful `TaskCreate` or `TaskUpdate` saves the whole list with
-`pi.appendEntry()` before replacing live state, including calls that change
-nothing. The custom entry has the type `pi-todos-tasks` and contains
-`data: { version, tasks, highWaterMark, toolCallId }`, where `highWaterMark` is
-the highest id assigned so far. These entries stay on the session branch and
-never enter model context. `TaskGet`, `TaskList` and calls for an unknown id
-save nothing.
+| Input or view | Bound |
+| --- | --- |
+| Operations per write | 50 |
+| Prerequisites per task | 100 distinct IDs |
+| Selected detail IDs per read | 5 |
+| Subject | 240 code points |
+| Requirements | 8,000 code points |
+| Progress | 2,000 code points |
+| Owner or active label | 160 code points |
+| Stored task serialized as JSON | 16,000 UTF-16 units |
+| JSON nesting, including the request or snapshot envelope | 32 object/array levels |
+| Summary page | 20 records and 8,000 UTF-16 units |
+| Detail result | 24,000 UTF-16 units |
+| Current-task context | 20 records and 6,000 UTF-16 units |
+| Requirements/progress in context | At most 800 code points per field, shortened further when needed to fit |
 
-On session start, compaction and tree navigation, the list is restored from
-the latest valid snapshot on the branch, so navigating to another branch point
-restores the list saved there. Malformed snapshots and other format versions
-are skipped, and edges to tasks a snapshot does not contain are dropped.
-Calls made inside wrapper tools such as `codemode` run the same code and save
-their own snapshots.
+The record bound includes escaped text and metadata, ensuring at least one
+complete task can fit a detail response. Smaller summary and operation limits
+also bound write feedback. IDs must be positive decimal strings without a `#`,
+spaces, leading zeroes, or numeric coercion. Allocation stops at the largest
+safe integer. Input with unknown fields or another argument shape is rejected
+before the host can coerce it. Programmatic inputs must also be JSON values;
+explicit `undefined`, non-finite numbers, functions, and cycles are rejected.
 
-There are no task files on disk and no list shared between sessions. Snapshots
-from the earlier `todo` tool are not read.
+## Errors and structured output
 
-## Finished lists
+The same typed outcome produces JSON text in `content`, renderer `details`, and
+`structuredContent` for codemode. Both tools declare an output schema.
+Domain and persistence failures return `isError: true` with:
 
-When every visible task is `completed`, the list stays until the next agent
-run starts. The extension then clears it, keeping the id counter, and saves
-the empty list as a snapshot without a `toolCallId`. Claude Code clears a
-finished list a few seconds after its last task completes; clearing at the
-next run keeps the result on screen until you move on.
+```ts
+{
+  ok: false,
+  error: { code, field, message, operationIndex?, id? },
+  active?: SummaryPage
+}
+```
 
-## Task reminder
+The operation index is zero-based. An available state includes an active summary
+for recovery, including an explicit empty summary when appropriate. Unavailable
+state does not claim an empty plan. Raw schema failures occur before execution
+and are reported by the host's failed-tool mechanism. They do not write anything.
 
-When `taskReminder` is on (the default), the extension counts assistant turns
-on the session branch. Once 10 turns have passed since the last `TaskCreate`
-or `TaskUpdate` call, and 10 since the last reminder, the end of the turn adds
-a hidden message, the same text Claude Code sends, suggesting the task tools
-if they are relevant. It is stored in the session, so later turns count from
-it. No reminder is added after an aborted or failed turn, or while `TaskCreate`
-is not an active tool. See [configuration.md](configuration.md#taskreminder).
+Persistence errors leave live state unchanged but may have an uncertain durable
+outcome in the host. Reload and inspect before retrying a create; there is no
+idempotency key or automatic retry mechanism.
+
+## Persistence and lifecycle
+
+Snapshot type `pi-todos-tasks` uses format version 2 with tasks, highWaterMark,
+and the originating toolCallId. Only this format is read or written. Every task
+snapshot on the selected branch must be supported and valid; invalid data is
+not skipped to recover an earlier state. A restoration failure blocks task tools
+until a new session or valid branch is selected. Other extensions' entries are
+not task snapshots.
+
+There are no legacy tools, argument repairs, snapshot converters, downgrade
+handlers, or historical result adapters. Existing session files remain untouched.
+No tasks are inferred from tool-result text or nested-call diagnostics.
+
+Completed work remains stored and reopenable. No run-start clearing, hidden-task
+policy, reminder timer, or resume acknowledgement exists. The
+[current context policy](configuration.md#task-context) and the panel are
+projections of the same state.

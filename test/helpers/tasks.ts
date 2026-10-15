@@ -9,8 +9,7 @@ export function makeTask(id = "1", overrides: Partial<Omit<Task, "id">> = {}): T
 		subject: `Task ${id}`,
 		description: `Details ${id}`,
 		status: "pending",
-		blocks: [],
-		blockedBy: [],
+		dependsOn: [],
 		...overrides,
 	};
 }
@@ -22,7 +21,7 @@ export function makeState(
 	return { tasks, highWaterMark };
 }
 
-export function makeSnapshotEntry(state: TaskState, toolCallId?: string): SessionEntry {
+export function makeSnapshotEntry(state: TaskState, toolCallId?: string): Extract<SessionEntry, { type: "custom" }> {
 	return {
 		type: "custom",
 		id: `snapshot-${state.highWaterMark}`,

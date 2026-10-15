@@ -91,41 +91,38 @@ describe("task overlay", () => {
 		expectWindow(widget, 4, "↑ 3 above · ↓ 2 below");
 	});
 
-	it.each([
-		{ completed: 13, first: 6, footer: "↑ 5 above" },
-		{ completed: 15, first: 1, footer: "↓ 5 below" },
-	])("focuses unfinished work or the top when $completed tasks are completed", ({ completed, first, footer }) => {
-		expectWindow(setup(numberedTasks(completed)).widget, first, footer);
-	});
+	it.each([{ completed: 13, first: 6, footer: "↑ 5 above" }])(
+		"focuses unfinished work or the top when $completed tasks are completed",
+		({ completed, first, footer }) => {
+			expectWindow(setup(numberedTasks(completed)).widget, first, footer);
+		},
+	);
 
-	it("hides internal tasks and displays only open blockers", () => {
+	it("shows every task and displays only open blockers", () => {
 		const { widget } = setup([
 			makeTask("1", { metadata: { _internal: true }, status: "in_progress" }),
 			makeTask("2", { status: "completed" }),
 			makeTask("3"),
-			makeTask("4", { owner: "agent", blockedBy: ["2", "3", "missing"] }),
+			makeTask("4", { owner: "agent", dependsOn: ["2", "3"] }),
 		]);
 		const lines = widget.render(100);
-		expect(lines[0]).toBe("● Tasks (1/3)");
-		expect(lines.join("\n")).not.toContain("#1");
+		expect(lines[0]).toBe("● Tasks (1/4)");
+		expect(lines.join("\n")).toContain("#1");
 		expect(lines.join("\n")).toContain("#4 Task 4 @agent › blocked by #3");
 		expect(lines.join("\n")).not.toContain("blocked by #2");
 	});
 
-	it("keeps completed lists visible until the live state is cleared", () => {
-		const { overlay, widget, ui } = setup([makeTask("1", { status: "completed" })]);
-		expect(widget.render(100)[0]).toBe("○ Tasks (1/1)");
-		overlay.update();
-		expect(overlay.isRegistered()).toBe(true);
-		setTaskState("main", makeState([], 1));
+	it("hides completed-only panels without deleting their state", () => {
+		const { overlay, ui } = setup([makeTask("1")]);
+		setTaskState("main", makeState([makeTask("1", { status: "completed" })]));
 		overlay.update();
 		expect(overlay.isRegistered()).toBe(false);
 		expect(ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
 	});
 
-	it("unregisters an internal-only list and stays disposed", () => {
+	it("unregisters an empty list and stays disposed", () => {
 		const { overlay, ui } = setup([makeTask()]);
-		setTaskState("main", makeState([makeTask("1", { metadata: { _internal: true } })]));
+		setTaskState("main", makeState([]));
 		overlay.update();
 		expect(overlay.isRegistered()).toBe(false);
 		expect(ui.setWidget).toHaveBeenLastCalledWith("pi-todos", undefined);
@@ -137,12 +134,12 @@ describe("task overlay", () => {
 	});
 
 	it("collapses with the bound shortcut hint and requests a full redraw", () => {
-		const { overlay, widget, requestRender } = setup([makeTask("1", { status: "completed" })], 12, "ctrl+]");
+		const { overlay, widget, requestRender } = setup([makeTask("1")], 12, "ctrl+]");
 		overlay.toggleCollapse();
-		expect(widget.render(100)).toEqual(["○ Tasks (1/1)", "└─ ctrl+] to expand", ""]);
+		expect(widget.render(100)).toEqual(["● Tasks (0/1)", "└─ ctrl+] to expand", ""]);
 		expect(requestRender).toHaveBeenCalledWith(true);
 		overlay.toggleCollapse();
-		expect(widget.render(100)).toContain("└─ ✓ #1 Task 1");
+		expect(widget.render(100)).toContain("└─ ○ #1 Task 1");
 	});
 
 	it("shows every task while expanded and restores the clamped focused window", () => {
@@ -221,39 +218,6 @@ describe("task overlay", () => {
 		expect(widget.render(200)[0]).toContain("<accent>Tasks (0/1)</accent>");
 		Object.assign(ui, { theme: makeTheme() as Theme });
 		expect(widget.render(200)[0]).toBe("● Tasks (0/1)");
-	});
-
-	it("renders the same panel when the host has no MouseRegion", async () => {
-		const tasks = numberedTasks(10, 11);
-		const expected = setup(tasks).widget.render(100);
-		vi.doMock("@earendil-works/pi-tui", async (importOriginal) => ({
-			...(await importOriginal<typeof import("@earendil-works/pi-tui")>()),
-			MouseRegion: undefined,
-		}));
-		vi.resetModules();
-		try {
-			const { TodoOverlay: HostOverlay } = await import("./overlay.js");
-			const store = await import("./store.js");
-			store.setForeground("compat");
-			store.setTaskState("compat", makeState(tasks));
-			let widget: Component | undefined;
-			const theme = themeFallback();
-			const ui = createMockUI({
-				theme,
-				setWidget: vi.fn((_key, factory) => {
-					if (typeof factory === "function") widget = factory({ requestRender: vi.fn() } as unknown as TUI, theme);
-				}),
-			});
-			const overlay = new HostOverlay({ maxWidgetLines: 12, collapseKey: "alt+o" });
-			overlay.setUICtx(ui as unknown as ExtensionUIContext);
-			overlay.update();
-			if (!widget) throw new Error("missing widget");
-			expect(widget).not.toHaveProperty("handleMouse");
-			expect(widget.render(100)).toEqual(expected);
-		} finally {
-			vi.doUnmock("@earendil-works/pi-tui");
-			vi.resetModules();
-		}
 	});
 });
 

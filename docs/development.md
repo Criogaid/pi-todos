@@ -1,64 +1,88 @@
 # Development
 
-## Validate a checkout
+## Checks
 
-From the repository root, with Node.js 22+ and npm 11+:
+Use Node.js 22.19+ and npm 11+ from the repository root:
 
 ```sh
 npm ci --ignore-scripts --no-audit --no-fund
+npm run format
 npm run check
 npm test
 npm pack --dry-run --ignore-scripts --json
 git diff --check
 ```
 
-`--ignore-scripts` installs dependencies without changing local Git hooks or
-running dependency lifecycle scripts. Most tests run the tools, store and overlay
-against mocked Pi registration and lifecycle fixtures.
-`src/persistence.integration.test.ts` also runs the pinned host's execution pipeline
-and nested-call recorder, then reopens real session files to check restored state.
-Tests make no model requests and do not certify every Pi release.
+Tests make no model requests. `test/setup.ts` isolates HOME and USERPROFILE,
+removes inherited Pi/XDG configuration locations, and cleans its temporary home.
+Real session tests use their own temporary session directory. Never point
+fixtures at personal configuration or existing sessions.
 
-The checked-in dev host is `@earendil-works/pi-coding-agent@0.99.2`; the
-manifest declares host-provided packages as peers with `*`, as Pi requires.
-Mouse wheel scrolling in the overlay needs Pi 0.85 or later; older hosts show the
-panel without it. Run a real host smoke test on your intended Pi version before
-publishing. A useful smoke test is: create three tasks, make one block another,
-start and complete a task, delete one, then reload, compact, switch branches and
-check `/tasks`; finish the list and confirm it clears when the next run starts.
-
-## Use the checkout in Pi
-
-After installing dependencies in this checkout, disable any other extension that
-registers `TaskCreate`, `TaskGet`, `TaskList` or `TaskUpdate` for the target Pi
-session, and install the local package:
+The default development host is pinned to Pi 0.99.2. The persistence integration
+suite exercises its argument preparation, execution pipeline, nested-call
+recorder, session files, branch navigation, and compaction. To run the same suite
+against another installed host, set `PI_TODOS_TEST_HOST_ROOT` to that host's
+package directory (the directory containing its package.json), then run:
 
 ```sh
-pi install .
+npm test -- src/persistence.integration.test.ts
 ```
 
-Pi supports local package directories. Load one provider for the task tools
-and the `pi-todos` widget. Configuration is optional; see
-[configuration.md](configuration.md).
+The test resolves that package's SessionManager, wrapper, nested runner, and
+agent execution pipeline. Tool implementation imports and UI fixtures still use
+the checkout's dependencies. This probes the selected execution pipeline; it is
+not a complete interactive UI or live-provider certification. See the
+[validation record](validation.md).
 
-## Package and distribution
+## Local installation
 
-The package is `@criogaid/pi-todos` and is installed from Git or a local path.
-Its manifest is private, so it is not published to npm. It has no runtime
-dependencies beyond the Pi host and `typebox`, which Pi provides.
+Install the checkout with `pi install .`, then start a new session. Disable any
+other extension registering TaskRead or TaskWrite. Use only the new
+[configuration](configuration.md). The extension deliberately rejects old task
+snapshots; no test or installation step converts existing sessions.
 
-## Runtime boundaries
+The package is private and distributed through Git or a local path. No runtime
+dependencies are bundled beyond the host-provided peers. `npm pack --dry-run`
+checks packaging without publishing anything.
 
-- Lists are session-local. Unlike Claude Code, there are no task files on disk,
-  no file lock and no list shared between sessions or teammates.
-- Task data is persisted through Pi's custom session entries. The write completes
-  before live state is replaced; durability and recovery from interrupted JSONL
-  writes depend on Pi's session manager. There is no independent task database.
-- Resume context is added on the next context-hook invocation and acknowledged
-  by the corresponding successful assistant response. Errors or aborted
-  responses preserve it for retries. Generation checks keep newer lifecycle
-  events pending.
-- The task reminder is computed from the session branch at the end of each
-  turn; there is no timer. Nothing guarantees that a model obeys task data or
-  reminders.
-- All text, UI and model-facing, is English.
+## Ownership and invariants
+
+| Owner | Responsibility |
+| --- | --- |
+| `src/schema.ts` | Input/result schemas, derived types, limits, raw-input validation, and task errors. |
+| `src/model.ts` | Immutable batch evaluation, graph validation, status/dependency semantics, and bounded selectors. |
+| `src/persistence.ts` | One snapshot format; strict branch restoration, never conversion or fallback. |
+| `src/store.ts` | Session-keyed live state, restoration-failure state, and foreground selection. |
+| `src/tool.ts` | Two tool registrations, persist-before-publish commit, result adaptation, and `/tasks`. |
+| `src/context.ts` | Bounded current-state projection on every context hook. No persistent state. |
+| `src/index.ts` | Configuration and lifecycle wiring; UI resource cleanup. |
+| `src/config.ts` | One strict configuration schema and resolved defaults. |
+| `src/format.ts`, `src/sanitize.ts`, `src/overlay.ts` | Terminal presentation of task facts. |
+| `src/host.ts`, `src/overlay-loader.ts` | Host lifecycle and module-loading error boundaries. |
+
+Only a committed TaskWrite or branch restoration replaces live task state.
+No await occurs between evaluating a batch, appending its snapshot, and
+publishing it, so nested writes cannot interleave those steps. Pi owns JSONL
+write durability. A persistence error may leave an uncertain durable outcome;
+reload before retrying creates. There is no exactly-once protocol.
+
+Raw tool arguments are validated before Pi's coercion. The host then supplies
+typed input to execute. Snapshot decoding validates the new format and graph.
+Downstream selectors trust these boundaries. Metadata is JSON data, never a
+carrier for private visibility or execution rules.
+
+When changing the contract, update schemas, consumers, tests, README, and the
+relevant reference together. Remove replaced paths in the same change. New
+snapshot versions do not imply support for reading older versions.
+
+## Behavioral evaluation
+
+Unit and integration tests establish task semantics, isolation, and restoration.
+The two-request recovery probe includes a successful non-task tool round trip;
+requirements and progress must still appear in the next request's context.
+
+A live provider evaluation should use a fixed model and repeated workflows,
+record actual requests and token/cache-read usage, and distinguish task-only
+requests from substantive work. Message or tool-call counts alone are not billing
+data. Do not claim cost reduction or improved model compliance from local tests.
+The bounded view adds recurring input while tasks remain active.

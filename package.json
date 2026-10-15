@@ -2,7 +2,7 @@
 	"name": "@criogaid/pi-todos",
 	"private": true,
 	"version": "0.1.0",
-	"description": "Pi extension. Claude Code's task tools for the model, rendered as a live overlay that survives /reload and conversation compaction.",
+	"description": "Session-local tasks with atomic batch updates, bounded model context, and a live Pi panel.",
 	"keywords": [
 		"pi-package",
 		"pi-extension",
@@ -57,7 +57,7 @@
 		"vitest": "4.1.10"
 	},
 	"engines": {
-		"node": ">=22.0.0",
+		"node": ">=22.19.0",
 		"npm": ">=11.0.0"
 	}
 }

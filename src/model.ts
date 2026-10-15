@@ -1,310 +1,230 @@
-/**
- * The task list domain, modeled on Claude Code's task tools: tasks with
- * sequential string ids, partial updates, two-way dependency edges and
- * deletion through a `deleted` status. Operations never mutate their input
- * state; they return a new one, so a snapshot can be saved before live state
- * changes.
- */
+/** Pure task transitions and selectors. Only final candidate states can be committed. */
+import { isDeepStrictEqual } from "node:util";
+import type { Static } from "typebox";
+import { TASK_READ } from "./names.js";
+import {
+	DEFAULT_TASK_STATUS,
+	type DetailPageSchema,
+	LIMITS,
+	type ReadInput,
+	type SummaryPageSchema,
+	type SummarySchema,
+	type Task,
+	TaskError,
+	type TaskOperation,
+	type TaskPatch,
+	type WriteResultSchema,
+} from "./schema.js";
 
-export const TASK_STATUSES = ["pending", "in_progress", "completed"] as const;
-export type TaskStatus = (typeof TASK_STATUSES)[number];
-
-/** Status value that removes a task instead of storing it. */
-export const DELETED_STATUS = "deleted";
-export const TASK_UPDATE_STATUSES = [...TASK_STATUSES, DELETED_STATUS] as const;
-export type TaskUpdateStatus = (typeof TASK_UPDATE_STATUSES)[number];
-
-export interface Task {
-	id: string;
-	subject: string;
-	description: string;
-	/** Present-continuous label shown while the task is in_progress. */
-	activeForm?: string;
-	owner?: string;
-	status: TaskStatus;
-	/** Ids of tasks that cannot start until this one completes. */
-	blocks: string[];
-	/** Ids of tasks that must complete before this one can start. */
-	blockedBy: string[];
-	metadata?: Record<string, unknown>;
-}
+export type { Task, TaskStatus } from "./schema.js";
 
 export interface TaskState {
-	/** Tasks in creation order, which is also id order. */
 	readonly tasks: readonly Task[];
-	/** Highest id ever assigned. Ids are never reused, even after deletion or a reset. */
 	readonly highWaterMark: number;
 }
-
-export const EMPTY_STATE: TaskState = Object.freeze({ tasks: Object.freeze([]) as readonly Task[], highWaterMark: 0 });
-
+export const EMPTY_STATE: TaskState = { tasks: [], highWaterMark: 0 };
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-
-export function isTaskStatus(value: unknown): value is TaskStatus {
-	return (TASK_STATUSES as readonly unknown[]).includes(value);
-}
-
-/** Tasks with `metadata._internal: true` are bookkeeping: hidden from TaskList, the overlay and counts. */
-export function isVisible(task: Task): boolean {
-	return task.metadata?._internal !== true;
-}
-
-export function visibleTasks(state: TaskState): Task[] {
-	return state.tasks.filter(isVisible);
-}
-
 export function findTask(state: TaskState, id: string): Task | undefined {
 	return state.tasks.find((task) => task.id === id);
 }
-
-/** The task's blockers that still exist and are not completed. */
+export function activeTasks(state: TaskState): Task[] {
+	return state.tasks.filter((task) => task.status !== "completed");
+}
+export function panelTasks(state: TaskState): readonly Task[] {
+	return activeTasks(state).length ? state.tasks : [];
+}
 export function openBlockers(state: TaskState, task: Task): string[] {
-	return task.blockedBy.filter((id) => {
-		const blocker = findTask(state, id);
-		return blocker !== undefined && blocker.status !== "completed";
-	});
+	return task.dependsOn.filter((id) => findTask(state, id)?.status !== "completed");
 }
-
-/** One TaskList row: a visible task with only its open blockers. */
-export interface TaskSummary {
-	id: string;
-	subject: string;
-	status: TaskStatus;
-	owner?: string;
-	blockedBy: string[];
-}
-
-export function summarizeTasks(state: TaskState): TaskSummary[] {
-	return visibleTasks(state).map((task) => {
-		const summary: TaskSummary = {
-			id: task.id,
-			subject: task.subject,
-			status: task.status,
-			blockedBy: openBlockers(state, task),
-		};
-		if (task.owner !== undefined) summary.owner = task.owner;
-		return summary;
-	});
-}
-
-/**
- * The task to pick up next: the lowest-id visible task that is pending, has no
- * owner and no open blockers.
- */
-export function nextAvailableTask(state: TaskState): Task | undefined {
-	return visibleTasks(state).find(
-		(task) => task.status === "pending" && task.owner === undefined && openBlockers(state, task).length === 0,
-	);
-}
-
-/** Ids of the other visible tasks that are in_progress, besides `id`. */
-export function otherTasksInProgress(state: TaskState, id: string): string[] {
-	return visibleTasks(state)
-		.filter((task) => task.id !== id && task.status === "in_progress")
-		.map((task) => task.id);
-}
-
-/** Shallow-merge `patch` into `base`; a `null` value removes that key. An empty result is `undefined`. */
-function mergeMetadata(
-	base: Record<string, unknown> | undefined,
-	patch: Record<string, unknown>,
-): Record<string, unknown> | undefined {
-	const merged: Record<string, unknown> = { ...base };
-	for (const [key, value] of Object.entries(patch)) {
-		if (value === null) delete merged[key];
-		else merged[key] = value;
-	}
-	return Object.keys(merged).length > 0 ? merged : undefined;
-}
-
-function copyTask(task: Task): Task {
-	return { ...task, blocks: [...task.blocks], blockedBy: [...task.blockedBy] };
-}
-
-export interface CreateTaskInput {
-	subject: string;
-	description: string;
-	activeForm?: string;
-	/** Initial status; `pending` when omitted. */
-	status?: TaskStatus;
-	addBlocks?: string[];
-	addBlockedBy?: string[];
-	metadata?: Record<string, unknown>;
-}
-
-/**
- * Append a task with the next id. Edges to existing tasks are recorded on
- * both sides, as `updateTask` records them; unknown ids are skipped.
- */
-export function createTask(state: TaskState, input: CreateTaskInput): { state: TaskState; task: Task } {
-	const highWaterMark = state.highWaterMark + 1;
-	if (!Number.isSafeInteger(highWaterMark)) throw new Error("task id space exhausted");
-	const task: Task = {
-		id: String(highWaterMark),
-		subject: input.subject,
-		description: input.description,
-		status: input.status ?? "pending",
-		blocks: [],
-		blockedBy: [],
+export type TaskSummary = Readonly<Static<typeof SummarySchema>>;
+export function summarizeTask(state: TaskState, task: Task): TaskSummary {
+	return {
+		id: task.id,
+		subject: task.subject,
+		status: task.status,
+		...(task.owner !== undefined && { owner: task.owner }),
+		blockedBy: openBlockers(state, task),
 	};
-	if (input.activeForm !== undefined) task.activeForm = input.activeForm;
-	const metadata = input.metadata && mergeMetadata(undefined, input.metadata);
-	if (metadata) task.metadata = metadata;
-	const created: TaskState = { tasks: [...state.tasks, task], highWaterMark };
-	if (!input.addBlocks?.length && !input.addBlockedBy?.length) return { state: created, task };
-	const linked = updateTask(created, {
-		taskId: task.id,
-		addBlocks: input.addBlocks,
-		addBlockedBy: input.addBlockedBy,
-	});
-	return { state: linked.state, task: findTask(linked.state, task.id)! };
 }
-
-export interface UpdateTaskInput {
-	taskId: string;
-	subject?: string;
-	description?: string;
-	activeForm?: string;
-	owner?: string;
-	status?: TaskUpdateStatus;
-	addBlocks?: string[];
-	addBlockedBy?: string[];
-	metadata?: Record<string, unknown>;
-}
-
-/** Field names reported by an update. The order is the order Claude Code reports them in. */
-export type UpdatedField =
-	| "subject"
-	| "description"
-	| "activeForm"
-	| "owner"
-	| "metadata"
-	| "status"
-	| "blocks"
-	| "blockedBy"
-	| typeof DELETED_STATUS;
-
-export interface UpdateOutcome {
-	success: boolean;
-	taskId: string;
-	updatedFields: UpdatedField[];
-	error?: string;
-	statusChange?: { from: TaskStatus; to: TaskUpdateStatus };
-}
-
-export const TASK_NOT_FOUND = "Task not found";
-
-/** Remove a task and every edge that points at it. */
-function deleteTask(state: TaskState, id: string): TaskState {
-	const tasks = state.tasks
-		.filter((task) => task.id !== id)
-		.map((task) =>
-			task.blocks.includes(id) || task.blockedBy.includes(id)
-				? {
-						...task,
-						blocks: task.blocks.filter((other) => other !== id),
-						blockedBy: task.blockedBy.filter((other) => other !== id),
-					}
-				: task,
-		);
-	return { tasks, highWaterMark: state.highWaterMark };
-}
-
-/**
- * Apply a partial update. Only fields that change are reported, except
- * `metadata`, which is reported whenever it is given. Status transitions are
- * not restricted. New edges are recorded on both tasks; ids that do not exist,
- * and the task's own id, are skipped. Setting `deleted` removes the task and
- * ignores the other fields.
- */
-export function updateTask(state: TaskState, input: UpdateTaskInput): { state: TaskState; outcome: UpdateOutcome } {
-	const current = findTask(state, input.taskId);
-	if (!current) {
-		return {
-			state,
-			outcome: { success: false, taskId: input.taskId, updatedFields: [], error: TASK_NOT_FOUND },
-		};
-	}
-	if (input.status === DELETED_STATUS) {
-		return {
-			state: deleteTask(state, current.id),
-			outcome: {
-				success: true,
-				taskId: current.id,
-				updatedFields: [DELETED_STATUS],
-				statusChange: { from: current.status, to: DELETED_STATUS },
-			},
-		};
-	}
-
-	const tasks = state.tasks.map(copyTask);
-	const byId = new Map(tasks.map((task) => [task.id, task]));
-	const task = byId.get(current.id)!;
-	const updatedFields: UpdatedField[] = [];
-	let statusChange: UpdateOutcome["statusChange"];
-
-	if (input.subject !== undefined && input.subject !== task.subject) {
-		task.subject = input.subject;
-		updatedFields.push("subject");
-	}
-	if (input.description !== undefined && input.description !== task.description) {
-		task.description = input.description;
-		updatedFields.push("description");
-	}
-	if (input.activeForm !== undefined && input.activeForm !== task.activeForm) {
-		task.activeForm = input.activeForm;
-		updatedFields.push("activeForm");
-	}
-	if (input.owner !== undefined && input.owner !== task.owner) {
-		task.owner = input.owner;
-		updatedFields.push("owner");
-	}
-	if (input.metadata !== undefined) {
-		const metadata = mergeMetadata(task.metadata, input.metadata);
-		if (metadata) task.metadata = metadata;
-		else delete task.metadata;
-		updatedFields.push("metadata");
-	}
-	if (input.status !== undefined && input.status !== task.status) {
-		statusChange = { from: task.status, to: input.status };
-		task.status = input.status;
-		updatedFields.push("status");
-	}
-
-	const link = (blocker: Task, blocked: Task): boolean => {
-		const added = !blocker.blocks.includes(blocked.id) || !blocked.blockedBy.includes(blocker.id);
-		if (!blocker.blocks.includes(blocked.id)) blocker.blocks.push(blocked.id);
-		if (!blocked.blockedBy.includes(blocker.id)) blocked.blockedBy.push(blocker.id);
-		return added;
-	};
-	const others = (ids: string[] | undefined): Task[] =>
-		(ids ?? []).flatMap((id) => {
-			const other = id === task.id ? undefined : byId.get(id);
-			return other ? [other] : [];
+export type SummaryPage = Readonly<Static<typeof SummaryPageSchema>>;
+export type DetailPage = Readonly<Static<typeof DetailPageSchema>>;
+export type ReadResult = SummaryPage | DetailPage;
+export function readTasks(state: TaskState, input: ReadInput): ReadResult {
+	if (input.view === "details" && input.ids) {
+		const selected = input.ids.map((id) => {
+			const task = findTask(state, id);
+			if (!task)
+				throw new TaskError("not_found", "ids", `task does not exist; use ${TASK_READ} summary`, undefined, id);
+			return { ...structuredClone(task), blockedBy: openBlockers(state, task) };
 		});
-	let blocksAdded = false;
-	for (const blocked of others(input.addBlocks)) blocksAdded = link(task, blocked) || blocksAdded;
-	if (blocksAdded) updatedFields.push("blocks");
-	let blockedByAdded = false;
-	for (const blocker of others(input.addBlockedBy)) blockedByAdded = link(blocker, task) || blockedByAdded;
-	if (blockedByAdded) updatedFields.push("blockedBy");
-
-	const outcome: UpdateOutcome = { success: true, taskId: task.id, updatedFields };
-	if (statusChange) outcome.statusChange = statusChange;
-	return { state: { tasks, highWaterMark: state.highWaterMark }, outcome };
+		const tasks: DetailPage["tasks"][number][] = [];
+		for (const task of selected) {
+			const candidate = {
+				ok: true,
+				view: "details",
+				tasks: [...tasks, task],
+				nextIds: input.ids.slice(tasks.length + 1),
+			};
+			if (JSON.stringify(candidate).length > LIMITS.outputChars) break;
+			tasks.push(task);
+		}
+		return { ok: true, view: "details", tasks, nextIds: input.ids.slice(tasks.length) };
+	}
+	return summarizeTasks(state, input);
+}
+export function summarizeTasks(state: TaskState, input: Pick<ReadInput, "scope" | "afterId"> = {}): SummaryPage {
+	const scope = input.scope ?? "active";
+	const selected = scope === "all" ? state.tasks : activeTasks(state);
+	const remaining = selected.filter((task) => input.afterId === undefined || Number(task.id) > Number(input.afterId));
+	const tasks: TaskSummary[] = [];
+	const page = (): SummaryPage => ({
+		ok: true,
+		view: "summary",
+		scope,
+		tasks,
+		total: selected.length,
+		omitted: remaining.length - tasks.length,
+		...(tasks.length < remaining.length && tasks.length > 0 && { nextAfterId: tasks[tasks.length - 1].id }),
+	});
+	for (const task of remaining.slice(0, LIMITS.summaryItems)) {
+		tasks.push(summarizeTask(state, task));
+		if (JSON.stringify(page()).length > LIMITS.summaryChars) {
+			tasks.pop();
+			break;
+		}
+	}
+	return page();
 }
 
-/** Clear every task while keeping the id high-water mark, so later ids stay unique. */
-export function resetTasks(state: TaskState): TaskState {
-	return { tasks: [], highWaterMark: state.highWaterMark };
+export type WriteResult = Readonly<Static<typeof WriteResultSchema>>;
+type OperationOutcome = WriteResult["outcomes"][number];
+function patchTask(task: Task, patch: TaskPatch): Task {
+	const result = { ...task, ...structuredClone(patch) };
+	return {
+		id: result.id,
+		subject: result.subject,
+		description: result.description,
+		status: result.status,
+		dependsOn: result.dependsOn,
+		...(result.progress != null && { progress: result.progress }),
+		...(result.activeForm != null && { activeForm: result.activeForm }),
+		...(result.owner != null && { owner: result.owner }),
+		...(result.metadata != null && { metadata: result.metadata }),
+	};
+}
+export function validateTaskSize(task: Task, operationIndex?: number): void {
+	if (JSON.stringify(task).length > LIMITS.taskJsonChars)
+		throw new TaskError(
+			"invalid_input",
+			"task",
+			`serialized task must fit ${LIMITS.taskJsonChars} characters`,
+			operationIndex,
+			task.id,
+		);
 }
 
-/** A non-empty visible list whose tasks are all completed. */
-export function isFinished(state: TaskState): boolean {
-	const visible = visibleTasks(state);
-	return visible.length > 0 && visible.every((task) => task.status === "completed");
+/** Check graph invariants once on the final graph, including after snapshot decoding. */
+export function validateGraph(state: TaskState): void {
+	const byId = new Map(state.tasks.map((task) => [task.id, task]));
+	const pending = new Map<string, number>();
+	const dependents = new Map<string, string[]>();
+	for (const task of state.tasks) {
+		pending.set(task.id, task.dependsOn.length);
+		for (const id of task.dependsOn) {
+			if (!byId.has(id) || id === task.id)
+				throw new TaskError(
+					"invalid_graph",
+					"dependsOn",
+					"prerequisites must exist and differ from the task",
+					undefined,
+					task.id,
+				);
+			const rows = dependents.get(id) ?? [];
+			rows.push(task.id);
+			dependents.set(id, rows);
+		}
+	}
+	const ready = state.tasks.filter((task) => task.dependsOn.length === 0).map((task) => task.id);
+	for (let index = 0; index < ready.length; index++) {
+		for (const id of dependents.get(ready[index]) ?? []) {
+			// Every dependent was inserted into pending while validating the graph.
+			const count = pending.get(id)!;
+			pending.set(id, count - 1);
+			if (count === 1) ready.push(id);
+		}
+	}
+	if (ready.length !== state.tasks.length)
+		throw new TaskError("invalid_graph", "dependsOn", "dependencies must not contain a cycle");
+}
+
+export function applyOperations(
+	state: TaskState,
+	operations: readonly TaskOperation[],
+): { state: TaskState; result: WriteResult } {
+	const originalIds = new Set(state.tasks.map((task) => task.id));
+	let tasks = [...state.tasks];
+	let highWaterMark = state.highWaterMark;
+	const outcomes: OperationOutcome[] = [];
+	for (const [operationIndex, operation] of operations.entries()) {
+		const patch =
+			operation.action === "create" ? operation.task : operation.action === "update" ? operation.set : undefined;
+		for (const id of patch?.dependsOn ?? []) {
+			if (!originalIds.has(id))
+				throw new TaskError("not_found", "dependsOn", "ID must exist before this request", operationIndex, id);
+		}
+		if (operation.action === "create") {
+			if (!Number.isSafeInteger(++highWaterMark))
+				throw new TaskError("invalid_input", "id", "task ID space exhausted", operationIndex);
+			const task = patchTask(
+				{
+					id: String(highWaterMark),
+					subject: operation.task.subject,
+					description: operation.task.description,
+					status: DEFAULT_TASK_STATUS,
+					dependsOn: [],
+				},
+				operation.task,
+			);
+			validateTaskSize(task, operationIndex);
+			tasks.push(task);
+			outcomes.push({ action: operation.action, id: task.id, changed: true });
+			continue;
+		}
+		const current = tasks.find((task) => task.id === operation.id);
+		if (!current || !originalIds.has(operation.id))
+			throw new TaskError(
+				"not_found",
+				"id",
+				"ID must exist before this request and not have been deleted",
+				operationIndex,
+				operation.id,
+			);
+		if (operation.action === "delete") {
+			tasks = tasks
+				.filter((task) => task.id !== operation.id)
+				.map((task) => ({ ...task, dependsOn: task.dependsOn.filter((id) => id !== operation.id) }));
+			outcomes.push({ action: operation.action, id: operation.id, changed: true });
+		} else {
+			const task = patchTask(current, operation.set);
+			validateTaskSize(task, operationIndex);
+			tasks = tasks.map((other) => (other.id === task.id ? task : other));
+			outcomes.push({ action: operation.action, id: task.id, changed: !isDeepStrictEqual(task, current) });
+		}
+	}
+	const candidate = { tasks, highWaterMark };
+	validateGraph(candidate);
+	const changed = !isDeepStrictEqual(state, candidate);
+	const final = changed ? candidate : state;
+	const active = summarizeTasks(final);
+	const next = activeTasks(final).find(
+		(task) => task.status === "pending" && task.owner === undefined && openBlockers(final, task).length === 0,
+	);
+	return {
+		state: final,
+		result: { ok: true, changed, outcomes, active, ...(next && { nextReady: summarizeTask(final, next) }) },
+	};
 }
 
 export interface TaskCounts {
@@ -313,9 +233,8 @@ export interface TaskCounts {
 	inProgress: number;
 	completed: number;
 }
-
 export function countTasks(tasks: readonly Task[]): TaskCounts {
-	const counts: TaskCounts = { total: tasks.length, pending: 0, inProgress: 0, completed: 0 };
+	const counts = { total: tasks.length, pending: 0, inProgress: 0, completed: 0 };
 	for (const task of tasks) {
 		if (task.status === "pending") counts.pending++;
 		else if (task.status === "in_progress") counts.inProgress++;

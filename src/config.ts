@@ -1,40 +1,45 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { TASK_TOOL_NAMES, type TaskToolName } from "./names.js";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
+import { TASK_READ, TASK_WRITE } from "./names.js";
+import { TaskError, validate } from "./schema.js";
 
-/** Prompt-copy overrides for one task tool. */
-export interface GuidanceFields {
-	description?: string;
-	promptSnippet?: string;
-	promptGuidelines?: string[];
-}
-
-/** Overrides keyed by tool name; a tool without an entry keeps its built-in copy. */
-export type Guidance = Partial<Record<TaskToolName, GuidanceFields>>;
-
-/**
- * Settings are read once, when Pi loads the extension. `/reload` re-runs the
- * extension factory, which is the single way to apply a config change — so the
- * bound shortcut, the hint that names it and the row budget never disagree.
- */
-export interface TaskSettings {
-	guidance: Guidance;
-	/** Inject one bounded unfinished-task summary after restore or compaction. */
-	resumeContext: boolean;
-	/** Remind the model about the task tools after 10 turns without a TaskCreate or TaskUpdate call. */
-	taskReminder: boolean;
-	/** Overlay content-row budget, heading included. */
-	maxWidgetLines: number;
-	/** Validated, lowercased collapse key, or `COLLAPSE_KEY_OFF`. */
-	collapseKey: string;
-}
+const GuidanceFieldsSchema = Type.Object(
+	{
+		description: Type.Optional(Type.String({ minLength: 1 })),
+		promptSnippet: Type.Optional(Type.String({ minLength: 1 })),
+		promptGuidelines: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
+	},
+	{ additionalProperties: false },
+);
+export type GuidanceFields = Static<typeof GuidanceFieldsSchema>;
+const GuidanceSchema = Type.Object(
+	{
+		[TASK_READ]: Type.Optional(GuidanceFieldsSchema),
+		[TASK_WRITE]: Type.Optional(GuidanceFieldsSchema),
+	},
+	{ additionalProperties: false },
+);
+export type Guidance = Static<typeof GuidanceSchema>;
 
 export const DEFAULT_MAX_WIDGET_LINES = 12;
 export const MIN_WIDGET_LINES = 3;
 export const DEFAULT_COLLAPSE_KEY = "ctrl+shift+t";
 /** Sentinel `collapseKey` value that registers no shortcut. */
 export const COLLAPSE_KEY_OFF = "off";
+
+const SettingsSchema = Type.Object(
+	{
+		guidance: { ...GuidanceSchema, default: {} },
+		taskContext: Type.Boolean({ default: true }),
+		maxWidgetLines: Type.Integer({ minimum: MIN_WIDGET_LINES, default: DEFAULT_MAX_WIDGET_LINES }),
+		collapseKey: Type.String({ default: DEFAULT_COLLAPSE_KEY }),
+	},
+	{ additionalProperties: false },
+);
+export type TaskSettings = Static<typeof SettingsSchema>;
 
 /**
  * `$XDG_CONFIG_HOME` when it is an absolute path (a leading `~` is expanded),
@@ -52,63 +57,22 @@ export function configPath(env: NodeJS.ProcessEnv = process.env): string {
 	return join(configHome(env), "pi-todos", "config.json");
 }
 
-/** A missing file yields `{}`; a malformed one warns and yields `{}`. */
-function readConfig(): Record<string, unknown> {
-	const path = configPath();
-	if (!existsSync(path)) return {};
-	try {
-		const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
-		return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-			? (parsed as Record<string, unknown>)
-			: {};
-	} catch (error) {
-		console.warn(`[pi-todos] invalid config at ${path}, using defaults: ${(error as Error).message}`);
-		return {};
-	}
-}
-
+/** Missing configuration uses defaults; invalid configuration prevents loading. */
 export function loadSettings(): TaskSettings {
-	const raw = readConfig();
-	return {
-		guidance: resolveGuidance(raw.guidance),
-		resumeContext: raw.resumeContext !== false,
-		taskReminder: raw.taskReminder !== false,
-		maxWidgetLines: resolveMaxWidgetLines(raw.maxWidgetLines),
-		collapseKey: resolveCollapseKey(raw.collapseKey),
-	};
-}
-
-/** Resolve each tool's overrides; unknown tool names are ignored. */
-export function resolveGuidance(value: unknown): Guidance {
-	if (value === null || typeof value !== "object") return {};
-	const raw = value as Record<string, unknown>;
-	const guidance: Guidance = {};
-	for (const name of TASK_TOOL_NAMES) {
-		const fields = resolveGuidanceFields(raw[name]);
-		if (Object.keys(fields).length > 0) guidance[name] = fields;
+	const path = configPath();
+	let raw: unknown = {};
+	if (existsSync(path)) {
+		try {
+			raw = JSON.parse(readFileSync(path, "utf-8"));
+		} catch (error) {
+			throw new Error(`config: cannot read valid JSON at ${path}`, { cause: error });
+		}
 	}
-	return guidance;
-}
-
-/** Keep only valid overrides: non-empty strings and a non-empty array of non-empty strings. */
-export function resolveGuidanceFields(value: unknown): GuidanceFields {
-	if (value === null || typeof value !== "object") return {};
-	const raw = value as Record<string, unknown>;
-	const guidance: GuidanceFields = {};
-	if (typeof raw.description === "string" && raw.description) guidance.description = raw.description;
-	if (typeof raw.promptSnippet === "string" && raw.promptSnippet) guidance.promptSnippet = raw.promptSnippet;
-	const lines = raw.promptGuidelines;
-	if (Array.isArray(lines) && lines.length > 0 && lines.every((line) => typeof line === "string" && line)) {
-		guidance.promptGuidelines = [...lines];
-	}
-	return guidance;
-}
-
-/** A non-integer or a value below the floor falls back to the default; no ceiling. */
-export function resolveMaxWidgetLines(value: unknown): number {
-	return typeof value === "number" && Number.isInteger(value) && value >= MIN_WIDGET_LINES
-		? value
-		: DEFAULT_MAX_WIDGET_LINES;
+	validate(Type.Partial(SettingsSchema), raw, "config");
+	const settings = validate(SettingsSchema, Value.Default(SettingsSchema, structuredClone(raw)), "config");
+	if (settings.collapseKey !== COLLAPSE_KEY_OFF && !isValidCollapseKeySpec(settings.collapseKey))
+		throw new TaskError("invalid_input", "config.collapseKey", "must be a lowercase Pi key specification or off");
+	return settings;
 }
 
 // Named keys accepted by pi-tui's `matchesKey`. parseKeyId lowercases the id
@@ -152,11 +116,4 @@ export function isValidCollapseKeySpec(spec: string): boolean {
 	if (modifiers.length !== new Set(modifiers).size) return false;
 	if (!modifiers.every((m) => MODIFIERS.has(m))) return false;
 	return base.length === 1 ? /[a-z0-9_\-!@#$%^&*()|~`'":;,./<>?[\]{}=\\]/.test(base) : SPECIAL_KEYS.has(base);
-}
-
-/** Missing, blank, non-string or invalid values fall back to the default. */
-export function resolveCollapseKey(value: unknown): string {
-	const spec = typeof value === "string" ? value.trim().toLowerCase() : "";
-	if (spec === COLLAPSE_KEY_OFF) return COLLAPSE_KEY_OFF;
-	return isValidCollapseKeySpec(spec) ? spec : DEFAULT_COLLAPSE_KEY;
 }

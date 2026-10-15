@@ -1,244 +1,163 @@
 import { describe, expect, it } from "vitest";
 import { makeState, makeTask } from "../test/helpers/index.js";
-import {
-	countTasks,
-	createTask,
-	EMPTY_STATE,
-	findTask,
-	isFinished,
-	isTaskStatus,
-	isVisible,
-	openBlockers,
-	resetTasks,
-	summarizeTasks,
-	TASK_STATUSES,
-	updateTask,
-	visibleTasks,
-} from "./model.js";
+import { activeTasks, applyOperations, EMPTY_STATE, openBlockers, panelTasks, readTasks } from "./model.js";
+import { LIMITS, parseWrite, TASK_STATUSES, TaskError } from "./schema.js";
 
-describe("task creation and identity", () => {
-	it("appends a pending task without changing existing tasks or the input", () => {
-		const original = makeState([makeTask("2")], 5);
-		const before = structuredClone(original);
-		const input = {
-			subject: "Write tests",
-			description: "Exercise the public behavior",
-			activeForm: "Writing tests",
-			metadata: { area: "test", remove: null },
-		};
-		const result = createTask(original, input);
-		expect(result.task).toEqual({
-			id: "6",
-			subject: input.subject,
-			description: input.description,
-			activeForm: input.activeForm,
-			metadata: { area: "test" },
-			status: "pending",
-			blocks: [],
-			blockedBy: [],
-		});
-		expect(result.state.tasks).toEqual([...original.tasks, result.task]);
-		expect(result.state.highWaterMark).toBe(6);
-		expect(original).toEqual(before);
-		expect(input.metadata).toEqual({ area: "test", remove: null });
-	});
-
-	it.each([undefined, {}, { removed: null }])("omits empty metadata: %j", (metadata) => {
-		expect(createTask(EMPTY_STATE, { subject: "Task", description: "Details", metadata }).task).not.toHaveProperty(
-			"metadata",
-		);
-	});
-
-	it("never reuses an id after deletion or reset", () => {
-		const first = createTask(EMPTY_STATE, { subject: "First", description: "" });
-		const deleted = updateTask(first.state, { taskId: first.task.id, status: "deleted" }).state;
-		const second = createTask(deleted, { subject: "Second", description: "" });
-		const reset = resetTasks(second.state);
-		expect(reset.tasks).toEqual([]);
-		expect(reset.highWaterMark).toBe(second.state.highWaterMark);
-		const third = createTask(reset, { subject: "Third", description: "" });
-		expect([first.task.id, second.task.id, third.task.id]).toEqual(["1", "2", "3"]);
-	});
-
-	it("stops before assigning an unsafe numeric id", () => {
-		const state = makeState([], Number.MAX_SAFE_INTEGER - 1);
-		const last = createTask(state, { subject: "Last", description: "" });
-		expect(last.task.id).toBe(String(Number.MAX_SAFE_INTEGER));
-		expect(() => createTask(last.state, { subject: "Overflow", description: "" })).toThrow("task id space exhausted");
-	});
+const create = (subject: string) => ({
+	action: "create" as const,
+	task: { subject, description: `Requirements for ${subject}` },
 });
-
-describe("partial task updates", () => {
-	it("returns the unchanged state for an unknown id", () => {
-		const original = makeState([makeTask()]);
-		const result = updateTask(original, { taskId: "99", subject: "Missing" });
-		expect(result.state).toBe(original);
-		expect(result.outcome).toEqual({ success: false, taskId: "99", updatedFields: [], error: "Task not found" });
-	});
-
-	it("reports changed fields in the caller-facing order", () => {
-		const original = makeState([makeTask("1"), makeTask("2"), makeTask("3")]);
+describe("atomic task transitions", () => {
+	it("completes, starts, and creates together with final-state hints", () => {
+		const original = makeState([makeTask("1", { status: "in_progress" }), makeTask("2", { dependsOn: ["1"] })]);
 		const before = structuredClone(original);
-		const result = updateTask(original, {
-			taskId: "1",
-			addBlockedBy: ["3"],
-			addBlocks: ["2"],
-			status: "in_progress",
-			metadata: { priority: 1 },
-			owner: "agent",
-			activeForm: "Working",
-			description: "New details",
-			subject: "New subject",
-		});
-		expect(result.outcome).toEqual({
-			success: true,
-			taskId: "1",
-			updatedFields: ["subject", "description", "activeForm", "owner", "metadata", "status", "blocks", "blockedBy"],
-			statusChange: { from: "pending", to: "in_progress" },
-		});
-		expect(findTask(result.state, "1")).toMatchObject({
-			subject: "New subject",
-			description: "New details",
-			activeForm: "Working",
-			owner: "agent",
-			metadata: { priority: 1 },
-			status: "in_progress",
-			blocks: ["2"],
-			blockedBy: ["3"],
-		});
+		const result = applyOperations(original, [
+			{ action: "update", id: "1", set: { status: "completed", progress: "Verified" } },
+			{ action: "update", id: "2", set: { status: "in_progress" } },
+			create("Follow-up"),
+		]);
 		expect(original).toEqual(before);
+		expect(result.state.tasks.map((task) => task.status)).toEqual(["completed", "in_progress", "pending"]);
+		expect(result.result.nextReady?.id).toBe("3");
+		expect(result.result.active.tasks.map((task) => task.id)).toEqual(["2", "3"]);
+		expect(result.state.tasks[0].description).toBe(original.tasks[0].description);
 	});
-
-	it("does not report identical fields or ignored dependency ids", () => {
-		const task = makeTask("1", { owner: "agent", activeForm: "Working" });
-		const original = makeState([task]);
-		const result = updateTask(original, {
-			taskId: "1",
-			subject: task.subject,
-			description: task.description,
-			activeForm: task.activeForm,
-			owner: task.owner,
-			status: task.status,
-			addBlocks: ["1", "missing"],
-			addBlockedBy: [],
+	it("rolls back earlier operations and allocated IDs on a middle failure", () => {
+		const state = makeState([makeTask()]);
+		expect(() =>
+			applyOperations(state, [create("New"), { action: "update", id: "99", set: {} }, create("Later")]),
+		).toThrow(TaskError);
+		expect(state.tasks).toHaveLength(1);
+		expect(applyOperations(state, [create("Retry")]).result.outcomes[0].id).toBe("2");
+	});
+	it("rejects references to IDs allocated in the same request and updates after deletion", () => {
+		expect(() => applyOperations(EMPTY_STATE, [create("First"), { action: "update", id: "1", set: {} }])).toThrow(
+			TaskError,
+		);
+		expect(() =>
+			applyOperations(EMPTY_STATE, [
+				create("First"),
+				{ action: "create", task: { subject: "Next", description: "Details", dependsOn: ["1"] } },
+			]),
+		).toThrow(TaskError);
+		expect(() =>
+			applyOperations(makeState([makeTask()]), [
+				{ action: "delete", id: "1" },
+				{ action: "update", id: "1", set: {} },
+			]),
+		).toThrow(TaskError);
+	});
+	it("replaces dependencies, accepts final graph repairs, and rejects unresolved cycles", () => {
+		const state = makeState([makeTask("1", { dependsOn: ["2"] }), makeTask("2"), makeTask("3")]);
+		const ops = [{ action: "update" as const, id: "2", set: { dependsOn: ["1"] } }];
+		expect(() => applyOperations(state, ops)).toThrow(TaskError);
+		const final = applyOperations(state, [...ops, { action: "update", id: "1", set: { dependsOn: ["3"] } }]).state;
+		expect(final.tasks.map((task) => task.dependsOn)).toEqual([["3"], ["1"], []]);
+		for (const dependsOn of [["1"], ["99"]])
+			expect(() => applyOperations(state, [{ action: "update", id: "1", set: { dependsOn } }])).toThrow(TaskError);
+	});
+	it("replaces metadata and clears optional fields without erasing requirements", () => {
+		const state = makeState([makeTask("1", { metadata: { old: true }, owner: "agent", progress: "Old" })]);
+		const changed = applyOperations(state, [
+			{
+				action: "update",
+				id: "1",
+				set: { metadata: { value: null, _internal: true }, owner: null, progress: "New" },
+			},
+		]).state;
+		expect(changed.tasks[0]).toMatchObject({
+			metadata: { value: null, _internal: true },
+			progress: "New",
+			description: "Details 1",
 		});
-		expect(result.outcome).toEqual({ success: true, taskId: "1", updatedFields: [] });
-		expect(result.state).toEqual(original);
+		expect(changed.tasks[0]).not.toHaveProperty("owner");
+		expect(activeTasks(changed)).toHaveLength(1);
+		expect(
+			applyOperations(changed, [{ action: "update", id: "1", set: { metadata: null } }]).state.tasks[0],
+		).not.toHaveProperty("metadata");
 	});
-
+	it("recognizes net no-ops including reordered metadata keys", () => {
+		const state = makeState([makeTask("1", { metadata: { a: 1, b: 2 } })]);
+		const result = applyOperations(state, [
+			{ action: "update", id: "1", set: { status: "completed" } },
+			{ action: "update", id: "1", set: { status: "pending", metadata: { b: 2, a: 1 } } },
+		]);
+		expect(result.state).toBe(state);
+		expect(result.result.changed).toBe(false);
+	});
+	it("deletes references without reusing IDs and rejects exhausted IDs", () => {
+		const state = makeState([makeTask("1"), makeTask("2", { dependsOn: ["1"] })]);
+		const final = applyOperations(state, [{ action: "delete", id: "1" }]).state;
+		expect(final.tasks[0].dependsOn).toEqual([]);
+		expect(applyOperations(final, [create("New")]).result.outcomes[0].id).toBe("3");
+		expect(() => applyOperations(makeState([], Number.MAX_SAFE_INTEGER), [create("Overflow")])).toThrow(TaskError);
+	});
 	it.each(TASK_STATUSES.flatMap((from) => TASK_STATUSES.map((to) => ({ from, to }))))(
 		"allows $from to $to",
 		({ from, to }) => {
-			const result = updateTask(makeState([makeTask("1", { status: from })]), { taskId: "1", status: to });
-			expect(result.state.tasks[0].status).toBe(to);
-			expect(result.outcome.updatedFields).toEqual(from === to ? [] : ["status"]);
-			if (from === to) expect(result.outcome).not.toHaveProperty("statusChange");
-			else expect(result.outcome.statusChange).toEqual({ from, to });
+			const state = makeState([
+				makeTask("1", { status: from }),
+				makeTask("2", { dependsOn: ["1"], status: "completed" }),
+			]);
+			const final = applyOperations(state, [{ action: "update", id: "1", set: { status: to } }]).state;
+			expect(final.tasks[0].status).toBe(to);
+			expect(final.tasks[1].status).toBe("completed");
+			expect(openBlockers(final, final.tasks[1])).toEqual(to === "completed" ? [] : ["1"]);
 		},
 	);
-
-	it("shallow-merges metadata, deletes null keys and always reports metadata", () => {
-		const original = makeState([makeTask("1", { metadata: { keep: 1, remove: "old", nested: { old: true } } })]);
-		const before = structuredClone(original);
-		const merged = updateTask(original, { taskId: "1", metadata: { remove: null, nested: { new: true } } });
-		expect(merged.state.tasks[0].metadata).toEqual({ keep: 1, nested: { new: true } });
-		expect(merged.outcome.updatedFields).toEqual(["metadata"]);
-		const unchanged = updateTask(merged.state, { taskId: "1", metadata: {} });
-		expect(unchanged.outcome.updatedFields).toEqual(["metadata"]);
-		const empty = updateTask(merged.state, { taskId: "1", metadata: { keep: null, nested: null } });
-		expect(empty.state.tasks[0]).not.toHaveProperty("metadata");
-		expect(original).toEqual(before);
+});
+describe("bounded shared views", () => {
+	it("hides completed-only panels but retains readable and reopenable tasks", () => {
+		const state = makeState([makeTask("1", { status: "completed" })]);
+		expect(panelTasks(state)).toEqual([]);
+		expect(readTasks(state, {}).tasks).toEqual([]);
+		expect(readTasks(state, { scope: "all" }).tasks).toHaveLength(1);
+		expect(
+			panelTasks(applyOperations(state, [{ action: "update", id: "1", set: { status: "in_progress" } }]).state),
+		).toHaveLength(1);
 	});
-
-	it.each(["addBlocks", "addBlockedBy"] as const)(
-		"deduplicates %s and records both sides without mutating input",
-		(field) => {
-			const original = makeState([makeTask("1"), makeTask("2")]);
-			const before = structuredClone(original);
-			const result = updateTask(original, { taskId: "1", [field]: ["2", "2", "1", "missing"] });
-			const [first, second] = result.state.tasks;
-			if (field === "addBlocks") {
-				expect(first.blocks).toEqual(["2"]);
-				expect(second.blockedBy).toEqual(["1"]);
-			} else {
-				expect(first.blockedBy).toEqual(["2"]);
-				expect(second.blocks).toEqual(["1"]);
-			}
-			expect(result.outcome.updatedFields).toEqual([field === "addBlocks" ? "blocks" : "blockedBy"]);
-			expect(updateTask(result.state, { taskId: "1", [field]: ["2"] }).outcome.updatedFields).toEqual([]);
-			expect(original).toEqual(before);
-		},
-	);
-
-	it.each(["addBlocks", "addBlockedBy"] as const)("repairs the missing reciprocal side for %s", (field) => {
-		const original = makeState([
-			makeTask("1", field === "addBlocks" ? { blocks: ["2"] } : { blockedBy: ["2"] }),
-			makeTask("2"),
-		]);
-		const before = structuredClone(original);
-		const result = updateTask(original, { taskId: "1", [field]: ["2"] });
-		expect(result.outcome.updatedFields).toEqual([field === "addBlocks" ? "blocks" : "blockedBy"]);
-		expect(field === "addBlocks" ? result.state.tasks[1].blockedBy : result.state.tasks[1].blocks).toEqual(["1"]);
-		expect(original).toEqual(before);
+	it("paginates by numeric creation ID without losing or duplicating tasks", () => {
+		const state = makeState(Array.from({ length: LIMITS.summaryItems + 3 }, (_, i) => makeTask(String(i + 1))));
+		const first = readTasks(state, {});
+		if (first.view !== "summary") throw new Error("expected summary");
+		const second = readTasks(state, { afterId: first.nextAfterId });
+		expect([...first.tasks, ...second.tasks].map((task) => task.id)).toEqual(state.tasks.map((task) => task.id));
 	});
-
-	it.each(TASK_STATUSES)("deletes a %s task, cleans all edges and ignores extra fields", (status) => {
-		const original = makeState([
-			makeTask("1", { blocks: ["2"] }),
-			makeTask("2", { status, blockedBy: ["1"], blocks: ["3"] }),
-			makeTask("3", { blockedBy: ["2"] }),
-		]);
-		const before = structuredClone(original);
-		const result = updateTask(original, {
-			taskId: "2",
-			status: "deleted",
-			subject: "Ignored",
-			metadata: { ignored: true },
-			addBlocks: ["1"],
+	it("returns complete detail records with explicit continuation under the output budget", () => {
+		const state = makeState(
+			Array.from({ length: LIMITS.selectedIds }, (_, i) =>
+				makeTask(String(i + 1), {
+					description: "x".repeat(LIMITS.descriptionChars),
+					progress: "y".repeat(LIMITS.progressChars),
+				}),
+			),
+		);
+		let ids = state.tasks.map((task) => task.id);
+		const found = [];
+		while (ids.length) {
+			const page = readTasks(state, { view: "details", ids });
+			if (page.view !== "details") throw new Error("expected details");
+			expect(page.tasks.length).toBeGreaterThan(0);
+			expect(JSON.stringify(page).length).toBeLessThanOrEqual(LIMITS.outputChars);
+			found.push(...page.tasks);
+			ids = page.nextIds;
+		}
+		expect(found.map(({ blockedBy: _blockedBy, ...task }) => task)).toEqual(state.tasks);
+		expect(() => readTasks(state, { view: "details", ids: ["99"] })).toThrow(TaskError);
+	});
+	it("rejects a task whose encoded contents exceed the record budget", () => {
+		const input = parseWrite({
+			operations: [{ action: "create", task: { subject: "Big", description: "\u0000x".repeat(3000) } }],
 		});
-		expect(result.outcome).toEqual({
-			success: true,
-			taskId: "2",
-			updatedFields: ["deleted"],
-			statusChange: { from: status, to: "deleted" },
-		});
-		expect(result.state.tasks).toEqual([makeTask("1"), makeTask("3")]);
-		expect(result.state.highWaterMark).toBe(3);
-		expect(original).toEqual(before);
+		expect(() => applyOperations(EMPTY_STATE, input.operations)).toThrow(TaskError);
 	});
 });
 
-describe("task visibility and summaries", () => {
-	it("omits internal tasks and completed or missing blockers from summaries", () => {
-		const state = makeState([
-			makeTask("1", { status: "completed" }),
-			makeTask("2", { status: "in_progress" }),
-			makeTask("3", { owner: "agent", blockedBy: ["1", "2", "missing"] }),
-			makeTask("4", { metadata: { _internal: true } }),
-		]);
-		expect(visibleTasks(state).map((task) => task.id)).toEqual(["1", "2", "3"]);
-		expect(openBlockers(state, state.tasks[2])).toEqual(["2"]);
-		expect(summarizeTasks(state)).toEqual([
-			{ id: "1", subject: "Task 1", status: "completed", blockedBy: [] },
-			{ id: "2", subject: "Task 2", status: "in_progress", blockedBy: [] },
-			{ id: "3", subject: "Task 3", status: "pending", owner: "agent", blockedBy: ["2"] },
-		]);
-		expect(isVisible(makeTask("5", { metadata: { _internal: "true" } }))).toBe(true);
-	});
-
-	it("counts statuses and considers only a non-empty visible completed list finished", () => {
-		expect(
-			countTasks([makeTask("1"), makeTask("2", { status: "in_progress" }), makeTask("3", { status: "completed" })]),
-		).toEqual({ total: 3, pending: 1, inProgress: 1, completed: 1 });
-		expect(isFinished(EMPTY_STATE)).toBe(false);
-		expect(isFinished(makeState([makeTask("1", { metadata: { _internal: true } })]))).toBe(false);
-		expect(
-			isFinished(
-				makeState([makeTask("1", { status: "completed" }), makeTask("2", { metadata: { _internal: true } })]),
-			),
-		).toBe(true);
-		expect(isFinished(makeState([makeTask("1")]))).toBe(false);
-		expect(isTaskStatus("deleted")).toBe(false);
-		expect(findTask(EMPTY_STATE, "missing")).toBeUndefined();
-	});
+it("does not expose mutable state through detail results", () => {
+	const state = makeState([makeTask("1", { metadata: { value: true } })]);
+	const page = readTasks(state, { view: "details", ids: ["1"] });
+	if (page.view !== "details") throw new Error("expected details");
+	page.tasks[0].dependsOn.push("99");
+	if (page.tasks[0].metadata) page.tasks[0].metadata.value = false;
+	expect(state.tasks[0]).toMatchObject({ dependsOn: [], metadata: { value: true } });
 });

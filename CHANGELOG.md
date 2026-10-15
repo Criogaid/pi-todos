@@ -9,23 +9,17 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **Breaking:** the `todo` tool is replaced by Claude Code's task tools: `TaskCreate`, `TaskGet`, `TaskList` and `TaskUpdate`. Tasks have sequential ids that are never reused; `TaskUpdate` changes only the fields it names, adds two-way `blocks`/`blockedBy` edges, merges `metadata` and deletes a task with `status: "deleted"`. Tool descriptions and the text the model reads back follow Claude Code. Any number of tasks may be `in_progress`, and the 100-item limit is gone.
-- **Breaking:** lists saved by the `todo` tool are not restored. Task lists are saved as `pi-todos-tasks` session entries.
-- **Breaking:** `/todos` is renamed `/tasks`.
-- **Breaking:** `guidance` in the config file is keyed by tool name (`{"guidance": {"TaskCreate": {...}}}`).
-- The overlay heading reads `Tasks (done/total)`, and rows show task ids, owners and open blockers. Tasks with `metadata._internal: true` are hidden.
-- A finished list is cleared when the next agent run starts, keeping the id counter, instead of being hidden.
-- The resume summary lists task ids and open blockers.
-
-### Added
-
-- Tool results carry `structuredContent` and declare an `outputSchema`, so `codemode` scripts receive structured output such as a new task's id.
-- Argument repair for `id`/`task_id` → `taskId`, `active_form` → `activeForm`, and ids written as numbers or with a leading `#`.
-- Claude Code's task reminder: a hidden message after 10 turns without `TaskCreate` or `TaskUpdate`. Disable it with `"taskReminder": false`.
-- `TaskCreate` takes optional `status`, `addBlocks` and `addBlockedBy`, so a task can start `in_progress` and depend on existing tasks in the same call.
-- A `TaskUpdate` that completes or deletes a task names the next available task in its text (`Next available task: #<id> <subject>`) and as `nextTask` in its structured output.
-- Starting a task while others are still `in_progress` (with `TaskCreate` or `TaskUpdate`) lists them in the result (`Also in progress: #2, #5. …`) and as `alsoInProgress`. Nothing is blocked or changed.
-- Tool descriptions and guidelines require two or more ready, independent task calls in one `multi_tool_use.parallel` request when available, or one assistant message otherwise. They forbid waiting between independent calls, cover cleanup deletions, and preserve sequential calls that need earlier results.
+- **Breaking:** replace TaskCreate, TaskGet, TaskList, and TaskUpdate with TaskRead and atomic batched TaskWrite. No aliases or argument repair remain.
+- **Breaking:** store only `dependsOn`; derive current blockers. Reject missing references, self-dependencies, and final cycles. Arrays and metadata use whole-field replacement; null clears optional fields.
+- **Breaking:** snapshot format 2 is the only supported format. Unsupported or malformed task snapshots block task access rather than falling back. Existing session files are not converted or rewritten.
+- **Breaking:** replace resumeContext and taskReminder with taskContext. Configuration rejects unknown fields, removed keys, and malformed values instead of applying fallback defaults.
+- Requirements and latest progress have separate fields. Every write returns final-state feedback, while reads paginate bounded summaries or complete details.
+- Completed tasks stay readable and reopenable; the panel hides completed-only plans. Remove automatic clearing and metadata-based hiding.
+- Replace one-shot resume summaries and periodic reminders with a bounded current-state view on every provider request.
+- No-op writes save nothing; a failed batch changes nothing. Nested writes use the same commit path.
+- Remove the older-host MouseRegion fallback. Prewarm UI modules only after a foreground session starts.
+- Add execution-pipeline tests that can target an installed Pi host without changing checkout dependencies.
+- Require Node.js 22.19 or newer.
 
 ## [0.1.0] - 2026-10-08
 

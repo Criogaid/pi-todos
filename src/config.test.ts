@@ -1,183 +1,69 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import * as config from "./config.js";
+import { describe, expect, it, vi } from "vitest";
+import { configPath, isValidCollapseKeySpec, loadSettings } from "./config.js";
 
-const temporaryDirectories: string[] = [];
-afterEach(() => {
-	vi.unstubAllEnvs();
-	for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
-});
-
-function writeConfig(path: string, contents: unknown): void {
+function writeConfig(value: unknown) {
+	const path = configPath();
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, typeof contents === "string" ? contents : JSON.stringify(contents), "utf8");
+	writeFileSync(path, typeof value === "string" ? value : JSON.stringify(value));
+	return path;
 }
-
-function configPaths() {
-	const xdg = mkdtempSync(join(tmpdir(), "pi-todos-config-"));
-	temporaryDirectories.push(xdg);
-	vi.stubEnv("XDG_CONFIG_HOME", xdg);
-	return {
-		xdg: join(xdg, "pi-todos", "config.json"),
-		home: join(homedir(), ".config", "pi-todos", "config.json"),
-	};
-}
-
-describe("config file selection", () => {
-	it("uses the trimmed absolute XDG directory for configPath", () => {
-		const xdg = join(tmpdir(), "pi-todos-path-test");
-		expect(config.configPath({ XDG_CONFIG_HOME: `  ${xdg}  ` })).toBe(join(xdg, "pi-todos", "config.json"));
+describe("strict configuration", () => {
+	it("uses defaults only when a file or supported field is absent", () => {
+		const initial = loadSettings();
+		writeConfig({ taskContext: false, collapseKey: "off", guidance: { TaskWrite: { promptGuidelines: [] } } });
+		expect(loadSettings()).toEqual({
+			...initial,
+			taskContext: false,
+			collapseKey: "off",
+			guidance: { TaskWrite: { promptGuidelines: [] } },
+		});
 	});
-
 	it.each([
-		["~", homedir()],
-		["~/x", join(homedir(), "x")],
-	])("expands %s in configPath", (value, directory) => {
-		expect(config.configPath({ XDG_CONFIG_HOME: value })).toBe(join(directory, "pi-todos", "config.json"));
+		{ resumeContext: false },
+		{ taskReminder: false },
+		{ guidance: { TaskCreate: {} } },
+		{ taskContext: "false" },
+		{ maxWidgetLines: 2 },
+		{ maxWidgetLines: 3.5 },
+		{ collapseKey: "ctr+]" },
+		{ collapseKey: " ALT+O " },
+		{ unknown: true },
+		{ guidance: { TaskRead: { unknown: "x" } } },
+		{ guidance: { TaskWrite: { description: "" } } },
+		null,
+		[],
+		42,
+		"{broken",
+	])("rejects invalid config without rewriting it: %j", (value) => {
+		const path = writeConfig(value);
+		const before = readFileSync(path, "utf8");
+		expect(() => loadSettings()).toThrow();
+		expect(readFileSync(path, "utf8")).toBe(before);
 	});
-
-	it.each([undefined, "", " \t ", "relative/path", "~user"])(
-		"uses the home config path for an invalid XDG value: %j",
-		(value) => {
-			expect(config.configPath({ XDG_CONFIG_HOME: value })).toBe(
-				join(homedir(), ".config", "pi-todos", "config.json"),
-			);
-		},
-	);
-
-	it("does not fall back to home config when the valid XDG config file is missing", () => {
-		const { xdg, home } = configPaths();
-		const defaults = config.loadSettings();
-		writeConfig(home, { maxWidgetLines: 50 });
-		expect(config.configPath()).toBe(xdg);
-		expect(config.loadSettings()).toEqual(defaults);
+	it("names removed fields in the error", () => {
+		writeConfig({ resumeContext: true });
+		expect(() => loadSettings()).toThrow(/resumeContext/);
 	});
-
-	it("reads the XDG config when a home config also exists", () => {
-		const { xdg, home } = configPaths();
-		writeConfig(xdg, { maxWidgetLines: 20 });
-		writeConfig(home, { maxWidgetLines: 50 });
-		expect(config.loadSettings().maxWidgetLines).toBe(20);
-	});
-
-	it("warns and stops at a malformed selected file instead of falling through", () => {
-		const { xdg, home } = configPaths();
-		writeConfig(xdg, "{broken");
-		writeConfig(home, { maxWidgetLines: 50 });
-		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-		expect(config.loadSettings().maxWidgetLines).toBe(config.DEFAULT_MAX_WIDGET_LINES);
-		expect(warn).toHaveBeenCalledWith(expect.stringContaining(xdg));
-	});
-
-	it("uses defaults when absent or when the selected JSON value is not an object", () => {
-		expect(config.loadSettings()).toMatchObject({
-			guidance: {},
-			resumeContext: true,
-			taskReminder: true,
-			collapseKey: config.DEFAULT_COLLAPSE_KEY,
-			maxWidgetLines: config.DEFAULT_MAX_WIDGET_LINES,
-		});
-		const { xdg: path } = configPaths();
-		for (const value of ["null", "[]", "42"]) {
-			writeConfig(path, value);
-			expect(config.loadSettings().guidance).toEqual({});
+	it("uses a valid XDG directory exclusively", () => {
+		writeConfig({ taskContext: false });
+		vi.stubEnv("XDG_CONFIG_HOME", join(homedir(), "isolated-xdg"));
+		try {
+			expect(loadSettings().taskContext).toBe(true);
+		} finally {
+			vi.unstubAllEnvs();
 		}
 	});
-
-	it("resolves settings from the selected file and reads changes on reload", () => {
-		const { xdg: path } = configPaths();
-		writeConfig(path, {
-			resumeContext: false,
-			taskReminder: false,
-			maxWidgetLines: 5,
-			collapseKey: " Alt+O ",
-			guidance: { TaskCreate: { description: "Track work" } },
-		});
-		expect(config.loadSettings()).toEqual({
-			resumeContext: false,
-			taskReminder: false,
-			maxWidgetLines: 5,
-			collapseKey: "alt+o",
-			guidance: { TaskCreate: { description: "Track work" } },
-		});
-		writeConfig(path, { resumeContext: true, collapseKey: "off" });
-		expect(config.loadSettings()).toMatchObject({ resumeContext: true, collapseKey: "off" });
+	it("resolves absolute, expanded, and invalid XDG paths", () => {
+		expect(configPath({ XDG_CONFIG_HOME: "~/custom" })).toBe(join(homedir(), "custom", "pi-todos", "config.json"));
+		expect(configPath({ XDG_CONFIG_HOME: "relative" })).toBe(join(homedir(), ".config", "pi-todos", "config.json"));
 	});
-
-	it.each(["relative/path", ""])("uses the home config directory for an invalid XDG value: %j", (value) => {
-		vi.stubEnv("XDG_CONFIG_HOME", value);
-		writeConfig(join(homedir(), ".config", "pi-todos", "config.json"), { maxWidgetLines: 7 });
-		expect(config.loadSettings().maxWidgetLines).toBe(7);
-	});
-
-	it.each([false, true, "false", 0, null, undefined])(
-		"disables task reminders only for boolean false: %j",
-		(taskReminder) => {
-			const { xdg: path } = configPaths();
-			writeConfig(path, { taskReminder });
-			expect(config.loadSettings().taskReminder).toBe(taskReminder !== false);
-		},
+	it.each(["ctrl+shift+t", "alt+o", "escape", "f12", "ctrl+]", "super+alt+enter"])("accepts key %s", (key) =>
+		expect(isValidCollapseKeySpec(key)).toBe(true),
 	);
-});
-
-describe("setting resolvers", () => {
-	it("keeps valid guidance overrides and drops malformed fields independently", () => {
-		const value = { description: "Custom", promptSnippet: 42, promptGuidelines: ["One", "Two"] };
-		const resolved = config.resolveGuidanceFields(value);
-		expect(resolved).toEqual({ description: "Custom", promptGuidelines: ["One", "Two"] });
-		value.promptGuidelines.push("Later");
-		expect(resolved.promptGuidelines).toEqual(["One", "Two"]);
-		for (const input of [undefined, null, [], "x", { description: "", promptGuidelines: ["", "ok"] }]) {
-			expect(config.resolveGuidanceFields(input)).toEqual({});
-		}
-	});
-
-	it("resolves valid fields independently for each task tool", () => {
-		expect(
-			config.resolveGuidance({
-				TaskCreate: { description: "Create", promptGuidelines: ["Track steps"] },
-				TaskGet: { description: "", promptSnippet: "Read" },
-				TaskList: { promptSnippet: 1, promptGuidelines: [] },
-				TaskUpdate: { description: "Update", promptSnippet: "Change" },
-				UnknownTool: { description: "Ignored" },
-			}),
-		).toEqual({
-			TaskCreate: { description: "Create", promptGuidelines: ["Track steps"] },
-			TaskGet: { promptSnippet: "Read" },
-			TaskUpdate: { description: "Update", promptSnippet: "Change" },
-		});
-		for (const value of [undefined, null, [], "text", 42]) expect(config.resolveGuidance(value)).toEqual({});
-	});
-
-	it.each([undefined, null, "12", 2, 0, -1, 3.5, NaN, Infinity])(
-		"falls back for an invalid row budget: %j",
-		(value) => {
-			expect(config.resolveMaxWidgetLines(value)).toBe(config.DEFAULT_MAX_WIDGET_LINES);
-		},
+	it.each(["", "+", "ctrl+", "ctrl++t", "win+t", "ctrl+ctrl+t", "ctr+t", "f13"])("rejects key %s", (key) =>
+		expect(isValidCollapseKeySpec(key)).toBe(false),
 	);
-
-	it.each([3, 8, 50])("accepts a whole row budget at or above the minimum: %i", (value) => {
-		expect(config.resolveMaxWidgetLines(value)).toBe(value);
-	});
-
-	it.each(["ctrl+shift+t", "alt+o", "escape", "f12", "ctrl+]", "super+alt+enter"])("accepts key spec %s", (spec) => {
-		expect(config.isValidCollapseKeySpec(spec)).toBe(true);
-	});
-
-	it.each(["", "+", "+t", "ctrl+", "ctrl++t", "win+t", "ctrl+ctrl+t", "ctr+t", "f13"])(
-		"rejects key spec %j",
-		(spec) => {
-			expect(config.isValidCollapseKeySpec(spec)).toBe(false);
-			expect(config.resolveCollapseKey(spec)).toBe(config.DEFAULT_COLLAPSE_KEY);
-		},
-	);
-
-	it("normalizes valid keys and supports disabling the shortcut", () => {
-		expect(config.resolveCollapseKey(" Alt+O ")).toBe("alt+o");
-		expect(config.resolveCollapseKey(" OFF ")).toBe(config.COLLAPSE_KEY_OFF);
-		for (const value of [undefined, null, 42, {}, []])
-			expect(config.resolveCollapseKey(value)).toBe(config.DEFAULT_COLLAPSE_KEY);
-	});
 });

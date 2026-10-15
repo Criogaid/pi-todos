@@ -1,61 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { makeTask, makeTheme } from "../test/helpers/index.js";
-import {
-	formatCommandLine,
-	formatCountsHeader,
-	formatCreated,
-	formatSummaryLine,
-	formatTaskDetail,
-	formatTaskList,
-	formatThemedLine,
-	formatUpdated,
-} from "./format.js";
-
-// Exact text is the externally consumed Claude Code task-tool result contract.
-describe("model-facing task results", () => {
-	it("formats creation and full detail with every dependency", () => {
-		const task = makeTask("3", {
-			subject: "Run tests",
-			description: "Unit\nand integration",
-			status: "in_progress",
-			blockedBy: ["1", "2"],
-			blocks: ["4"],
-		});
-		expect(formatCreated(task)).toBe("Task #3 created successfully: Run tests");
-		expect(formatTaskDetail(task)).toBe(
-			"Task #3: Run tests\nStatus: in_progress\nDescription: Unit\nand integration\nBlocked by: #1, #2\nBlocks: #4",
-		);
-		expect(formatTaskDetail(makeTask())).toBe("Task #1: Task 1\nStatus: pending\nDescription: Details 1");
-	});
-
-	it("formats summaries with optional owner and open blockers", () => {
-		const summary = {
-			id: "3",
-			subject: "Run tests",
-			status: "pending" as const,
-			owner: "agent",
-			blockedBy: ["1", "2"],
-		};
-		expect(formatSummaryLine(summary)).toBe("#3 [pending] Run tests (agent) [blocked by #1, #2]");
-		expect(formatTaskList([summary, { id: "4", subject: "Ship", status: "completed", blockedBy: [] }])).toBe(
-			"#3 [pending] Run tests (agent) [blocked by #1, #2]\n#4 [completed] Ship",
-		);
-		expect(formatTaskList([])).toBe("No tasks found");
-	});
-
-	it("formats updates, deletion, no-op trailing space and failures", () => {
-		expect(formatUpdated({ success: true, taskId: "2", updatedFields: ["subject", "status"] })).toBe(
-			"Updated task #2 subject, status",
-		);
-		expect(formatUpdated({ success: true, taskId: "2", updatedFields: ["deleted"] })).toBe("Updated task #2 deleted");
-		expect(formatUpdated({ success: true, taskId: "2", updatedFields: [] })).toBe("Updated task #2 ");
-		expect(formatUpdated({ success: false, taskId: "2", updatedFields: [], error: "Task not found" })).toBe(
-			"Task not found",
-		);
-		expect(formatUpdated({ success: false, taskId: "2", updatedFields: [] })).toBe("");
-	});
-});
+import { formatCommandLine, formatCountsHeader, formatThemedLine } from "./format.js";
 
 describe("terminal task formatting", () => {
 	it.each([

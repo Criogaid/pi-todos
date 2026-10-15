@@ -1,10 +1,11 @@
 import { EMPTY_STATE, type TaskState } from "./model.js";
+import { TaskError } from "./schema.js";
 
 /**
  * Live task lists keyed by session id, so a detached or child session in the
  * same process can never read or overwrite another session's list.
  */
-const sessions = new Map<string, TaskState>();
+const sessions = new Map<string, TaskState | Error>();
 
 /**
  * The session whose list the UI shows. Renderers have no session context, so
@@ -14,11 +15,22 @@ const sessions = new Map<string, TaskState>();
 let foreground: string | undefined;
 
 export function getTaskState(sessionId: string): TaskState {
-	return sessions.get(sessionId) ?? EMPTY_STATE;
+	const state = sessions.get(sessionId);
+	if (state instanceof Error)
+		throw new TaskError(
+			"unavailable",
+			"session",
+			"task restoration failed; start a new session or select a valid branch",
+		);
+	return state ?? EMPTY_STATE;
 }
 
 export function setTaskState(sessionId: string, state: TaskState): void {
 	sessions.set(sessionId, state);
+}
+
+export function failSession(sessionId: string, error: Error): void {
+	sessions.set(sessionId, error);
 }
 
 export function evictSession(sessionId: string): void {

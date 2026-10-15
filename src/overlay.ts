@@ -4,28 +4,29 @@
  * pay for it.
  *
  * Display rules:
- * - internal tasks (`metadata._internal`) are hidden; the heading counts the rest;
+ * - every task is inspectable; the panel hides when all tasks are completed;
  * - past the row budget the list becomes a window over the full list: the
  *   mouse wheel moves it (Pi's fullscreen renderer captures the mouse; Pi 0.85+)
  *   and the footer counts the rows hidden above and below. Pi's tool-output
  *   expansion still shows every task;
  * - a changed list opens the window at the first task in progress, else the
  *   first unfinished task; a write that changes nothing keeps the window;
- * - a finished list is cleared at the start of the next agent run (see
- *   index.ts), which removes the widget.
+ * - completed tasks remain in state and can be reopened through TaskWrite.
  */
 
 import type { ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
-import * as piTui from "@earendil-works/pi-tui";
-import { type TUI, type TuiMouseEvent, type TuiMouseEventResult, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	MouseRegion,
+	type TUI,
+	type TuiMouseEvent,
+	type TuiMouseEventResult,
+	truncateToWidth,
+} from "@earendil-works/pi-tui";
 import { formatThemedLine } from "./format.js";
-import { countTasks, openBlockers, type Task, visibleTasks } from "./model.js";
+import { countTasks, openBlockers, panelTasks, type Task } from "./model.js";
 import { getForegroundState } from "./store.js";
 
 const WIDGET_KEY = "pi-todos";
-
-/** Added in pi-tui 0.85.0; read off the namespace so older hosts still load the panel, without wheel scrolling. */
-const MouseRegion = piTui.MouseRegion as typeof piTui.MouseRegion | undefined;
 
 export interface OverlayOptions {
 	/** Content-row budget, heading included. */
@@ -110,7 +111,7 @@ export class TodoOverlay {
 					render: (width: number) => this.render(this.uiCtx?.theme ?? factoryTheme, width),
 					invalidate: () => {},
 				};
-				return MouseRegion ? new MouseRegion(panel, (event) => this.onMouse(event)) : panel;
+				return new MouseRegion(panel, (event) => this.onMouse(event));
 			},
 			{ placement: "aboveEditor" },
 		);
@@ -137,8 +138,8 @@ export class TodoOverlay {
 		}
 	}
 
-	private tasks(): Task[] {
-		return visibleTasks(getForegroundState());
+	private tasks(): readonly Task[] {
+		return panelTasks(getForegroundState());
 	}
 
 	/** Move the window to the current work when the list content has changed. */
@@ -181,7 +182,7 @@ export class TodoOverlay {
 
 	private render(theme: Theme, width: number): string[] {
 		const state = getForegroundState();
-		const tasks = visibleTasks(state);
+		const tasks = panelTasks(state);
 		if (tasks.length === 0) return [];
 		const clip = (line: string) => truncateToWidth(line, width, "…");
 		const counts = countTasks(tasks);
