@@ -3,7 +3,7 @@
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { COLLAPSE_KEY_OFF, loadSettings } from "./config.js";
-import { buildTaskContext, TASK_CONTEXT_TYPE } from "./context.js";
+import { buildTaskContext, carriedOverTasks, TASK_CONTEXT_TYPE, taskContextIndex } from "./context.js";
 import { formatError, type SessionCtx, sessionIdOf, unlessStale } from "./host.js";
 import { panelTasks } from "./model.js";
 import { TASK_WRITE } from "./names.js";
@@ -126,26 +126,35 @@ export default function (pi: ExtensionAPI, importOverlay?: OverlayImporter) {
 
 	pi.on("context", (event, ctx) => {
 		if (!settings.taskContext) return;
-		const id = unlessStale(() => sessionIdOf(ctx));
-		if (id === undefined) return;
-		const content = buildTaskContext(getTaskState(id));
-		// Replace this extension's transient view if another hook passes it back.
+		const branch = unlessStale(() => {
+			// A failed restoration keeps blocking task access here as it does in the tools.
+			getTaskState(sessionIdOf(ctx));
+			return ctx.sessionManager.getBranch();
+		});
+		if (branch === undefined) return;
+		// Drop this extension's transient view if another hook passes it back.
 		const messages = event.messages.filter(
 			(message) => message.role !== "custom" || message.customType !== TASK_CONTEXT_TYPE,
 		);
+		const visible = new Set(
+			messages.flatMap((message) => (message.role === "toolResult" ? [message.toolCallId] : [])),
+		);
+		const carried = carriedOverTasks(branch, visible);
+		const content = carried && buildTaskContext(carried.state);
+		if (!content) return messages.length === event.messages.length ? undefined : { messages };
+		const index = taskContextIndex(messages);
 		return {
-			messages: content
-				? [
-						...messages,
-						{
-							role: "custom" as const,
-							customType: TASK_CONTEXT_TYPE,
-							content,
-							display: false,
-							timestamp: Date.now(),
-						},
-					]
-				: messages,
+			messages: [
+				...messages.slice(0, index),
+				{
+					role: "custom" as const,
+					customType: TASK_CONTEXT_TYPE,
+					content,
+					display: false,
+					timestamp: carried.timestamp,
+				},
+				...messages.slice(index),
+			],
 		};
 	});
 
