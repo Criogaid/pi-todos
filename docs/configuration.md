@@ -19,7 +19,7 @@ that schema together.
 
 | Field | Rule | Default |
 | --- | --- | --- |
-| `taskContext` | Boolean. Add the current unfinished-task view to each provider request. | `true` |
+| `taskContext` | Boolean. When the snapshot behind the conversation's starting task state is no longer visible (for example after compaction), add a fixed view of that carried-over unfinished work to provider requests. | `true` |
 | `maxWidgetLines` | Integer of at least 3. Panel content rows including heading and overflow footer; the blank spacer is extra. | `12` |
 | `collapseKey` | Lowercase Pi key specification, or `"off"` to disable the shortcut. | `"ctrl+shift+t"` |
 | `guidance` | Optional overrides keyed only by `TaskRead` and `TaskWrite`. | Built-in guidance |

@@ -15,7 +15,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking:** replace resumeContext and taskReminder with taskContext. Configuration rejects unknown fields, removed keys, and malformed values instead of applying fallback defaults.
 - Requirements and latest progress have separate fields. Every write returns final-state feedback, while reads paginate bounded summaries or complete details.
 - Completed tasks stay readable and reopenable; the panel hides completed-only plans. Remove automatic clearing and metadata-based hiding.
-- Replace one-shot resume summaries and periodic reminders with a bounded current-state view on every provider request.
+- Replace one-shot resume summaries and periodic reminders with a bounded view of carried-over unfinished tasks, added only while the snapshot behind it is hidden (for example after compaction). The view is fixed in place, so it never breaks the prompt-cache prefix; visible TaskWrite results already carry the current summary.
 - No-op writes save nothing; a failed batch changes nothing. Nested writes use the same commit path.
 - Remove the older-host MouseRegion fallback. Prewarm UI modules only after a foreground session starts.
 - Add execution-pipeline tests that can target an installed Pi host without changing checkout dependencies.

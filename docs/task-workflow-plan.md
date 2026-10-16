@@ -201,25 +201,36 @@ Formatting determines text length and terminal styling. Neither layer redefines
 what completion or blocking means. Different surfaces can show different detail
 budgets without reporting different task facts.
 
-Use the existing `context` hook to derive one bounded active-task view for each
-provider request when task context is enabled. Prioritize requirements and latest
+Use the existing `context` hook to derive one bounded active-task view when task
+context is enabled and the visible conversation no longer contains the TaskWrite
+result behind its starting state. Prioritize requirements and latest
 progress for in-progress tasks, then pending-task summaries. Include omissions
 and a detail-query route. Quote task data and retain the rule that current user
 instructions take precedence. Do not inject completed history or arbitrary
 metadata into the normal context view.
 
-This view is transient and computed from current branch state. It is not another
-persistent task store and does not accumulate in the transcript. A non-task tool
-call, aborted response, or retry cannot acknowledge the view away; the next
-request derives it again. No unfinished tasks means no injected task view.
+This view is transient and computed from the latest snapshot recorded before the
+first visible TaskWrite result. It is not another persistent task store and does
+not accumulate in the transcript. A non-task tool call, aborted response, or
+retry cannot acknowledge the view away; the next request derives it again.
+Visible TaskWrite results already carry the current active summary, so no view
+is added while they cover the starting state. No unfinished carried-over tasks
+means no injected task view.
+
+The view sits right after the last compaction summary, or first, and depends only
+on hidden history. Appending a current-state view at the end of each request was
+rejected: the transient tail differs from what the next request contains at the
+same position, so on OpenAI Responses the cached prefix stopped at the first
+task write and every later request in the run paid full input.
 
 Replace the separate one-shot resume tracker and every-ten-turn reminder with
 this policy. Do not retain both policies behind modes. Context supplies current
 facts; concise tool guidance explains how to act on them. There is no generic
 nag to create tasks, no synthetic model request, and no timer stream of reminders.
 
-The trade-off is recurring context input. Keep the view bounded and measure its
-input/cache-read cost against the baseline. Do not promise better prompt caching.
+The trade-off is recurring context input after compaction. Keep the view bounded
+and measure its input/cache-read cost against the baseline. It must never change
+the request prefix between consecutive requests.
 The proposal must pass a two-request recovery probe and a long-task cost
 comparison before release. If it fails the cost/continuity target, revisit this
 single policy rather than layering the old reminders back on top.

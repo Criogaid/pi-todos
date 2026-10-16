@@ -73,12 +73,15 @@ include a bounded active summary and a next-ready suggestion when available.
 
 ## Continuity and inspection
 
-Each provider request receives a transient, bounded view of unfinished work when
-`taskContext` is enabled. In-progress tasks include requirements and progress;
-pending tasks use summaries. The view discloses shortened fields and omissions.
-It is rebuilt from current branch state, so a non-task tool call cannot consume
-it permanently. There are no periodic reminders or stored reminder messages.
-This adds recurring input; it does not promise token or cache savings.
+Every TaskWrite result carries the current active summary, so visible history
+already shows current task state. When `taskContext` is enabled and the snapshot
+that set the conversation's starting state is no longer visible, such as after
+compaction, requests receive a transient, bounded view of that carried-over state
+right after the compaction summary. In-progress tasks include requirements and
+progress; pending tasks use summaries. The view discloses shortened fields and
+omissions. It depends only on hidden history and stays at a fixed position, so
+consecutive requests keep the same prefix and prompt caching is preserved. There
+are no periodic reminders or stored reminder messages.
 
 Completed tasks remain readable and can be reopened. A completed-only plan hides
 the panel; `/tasks` still shows it. Starting another run never clears tasks.
