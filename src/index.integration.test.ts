@@ -1,15 +1,17 @@
-import type { ExtensionToolContext } from "@earendil-works/pi-coding-agent";
+import type { ContextEvent, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createMockCtx,
 	createMockPi,
+	makeAssistantMessage,
 	makeSnapshotEntry,
 	makeState,
 	makeTask,
+	makeToolResult,
 	makeUserMessage,
 } from "../test/helpers/index.js";
 import * as config from "./config.js";
-import { TASK_CONTEXT_TYPE } from "./context.js";
+import { buildTaskContext, TASK_CONTEXT_TYPE } from "./context.js";
 import registerExtension, { PREWARM_DELAY_MS } from "./index.js";
 import { isRecord, type TaskState } from "./model.js";
 import * as overlayModule from "./overlay.js";
@@ -25,12 +27,16 @@ function setup(importer = vi.fn(async () => overlayModule)) {
 		for (const handler of captured.events.get(name) ?? []) results.push(await handler(event, ctx));
 		return results;
 	}
-	async function context(ctx: ExtensionToolContext) {
-		const original = [makeUserMessage("Continue")];
+	async function context(
+		ctx: ExtensionToolContext,
+		original: ContextEvent["messages"] = [makeUserMessage("Continue")],
+	) {
 		const [result] = await emit("context", { messages: original }, ctx);
 		if (result === undefined) return [];
 		if (!isRecord(result) || !Array.isArray(result.messages)) throw new Error("invalid context result");
-		expect(result.messages[0]).toEqual(original[0]);
+		expect(
+			result.messages.filter((message) => !isRecord(message) || message.customType !== TASK_CONTEXT_TYPE),
+		).toEqual(original);
 		return result.messages.filter((message) => isRecord(message) && message.customType === TASK_CONTEXT_TYPE);
 	}
 	async function write(ctx: ExtensionToolContext, input: unknown) {
@@ -94,36 +100,131 @@ describe("session lifecycle", () => {
 		expect(ctx.ui.setWidget).toHaveBeenCalled();
 	});
 });
-describe("current task context", () => {
-	it("survives compaction followed by a non-task tool round trip", async () => {
+describe("carried-over task context", () => {
+	const summary = { role: "compactionSummary" as const, summary: "Earlier work", tokensBefore: 1000, timestamp: 0 };
+	function view(state: TaskState, timestamp = Date.parse("2026-01-01T00:00:00.000Z")) {
+		return {
+			role: "custom",
+			customType: TASK_CONTEXT_TYPE,
+			display: false,
+			content: buildTaskContext(state),
+			timestamp,
+		};
+	}
+	it("returns undefined while the snapshot's TaskWrite result is visible", async () => {
 		const h = setup();
-		const ctx = createMockCtx({ branch: branch(pending()) });
+		const ctx = createMockCtx({ branch: [makeSnapshotEntry(pending(), "write")] });
+		await h.emit("session_start", {}, ctx);
+		const messages = [makeUserMessage("Continue"), makeToolResult({ toolName: "TaskWrite", toolCallId: "write" })];
+		expect(await h.emit("context", { messages }, ctx)).toEqual([undefined]);
+	});
+	it("inserts the hidden snapshot immediately after the compaction summary and survives a non-task round trip", async () => {
+		const h = setup();
+		const snapshot = makeSnapshotEntry(pending(), "hidden-write");
+		const ctx = createMockCtx({ branch: [snapshot] });
 		await h.emit("session_start", {}, ctx);
 		await h.emit("session_compact", {}, ctx);
-		const first = await h.context(ctx);
-		await h.emit("message_end", { message: { role: "assistant", stopReason: "toolUse" } }, ctx);
+		const messages: ContextEvent["messages"] = [summary, makeUserMessage("Continue")];
+		expect(await h.emit("context", { messages }, ctx)).toEqual([
+			{ messages: [summary, view(pending()), messages[1]] },
+		]);
+		await h.emit("message_end", { message: makeAssistantMessage(["read"]) }, ctx);
 		await h.emit("tool_execution_end", { toolName: "read", isError: false }, ctx);
-		const second = await h.context(ctx);
-		expect(JSON.stringify(first)).toContain("Next: run tests");
-		expect(JSON.stringify(second)).toContain("Next: run tests");
+		const next = [...messages, makeAssistantMessage(["read"]), makeToolResult({ toolName: "read" })];
+		expect(await h.emit("context", { messages: next }, ctx)).toEqual([
+			{ messages: [summary, view(pending()), ...next.slice(1)] },
+		]);
 		expect(h.pi.appendEntry).not.toHaveBeenCalled();
-		expect(h.captured.events.has("turn_end")).toBe(false);
 	});
-	it("refreshes progress and removes the view when all tasks finish", async () => {
+	it("keeps the injected prefix identical as visible assistant and TaskWrite results are appended", async () => {
 		const h = setup();
-		const ctx = createMockCtx({ branch: branch(pending()) });
+		const nextState = makeState([makeTask("1", { status: "in_progress", progress: "Tests passed" })]);
+		const ctx = createMockCtx({
+			branch: [makeSnapshotEntry(pending(), "hidden"), makeSnapshotEntry(nextState, "visible")],
+		});
+		await h.emit("session_start", {}, ctx);
+		const messages: ContextEvent["messages"] = [
+			summary,
+			makeUserMessage("Continue"),
+			makeToolResult({ toolName: "TaskWrite", toolCallId: "visible" }),
+		];
+		const [first] = await h.emit("context", { messages }, ctx);
+		expect(first).toEqual({ messages: [summary, view(pending()), ...messages.slice(1)] });
+		messages.push(makeAssistantMessage(["TaskWrite"]));
+		const [second] = await h.emit("context", { messages }, ctx);
+		expect(second).toEqual({ messages: [summary, view(pending()), ...messages.slice(1)] });
+		messages.push(makeToolResult({ toolName: "TaskWrite", toolCallId: "new-visible" }));
+		const [third] = await h.emit("context", { messages }, ctx);
+		expect(third).toEqual({ messages: [summary, view(pending()), ...messages.slice(1)] });
+	});
+	it("uses only the hidden state before the first visible snapshot even after later writes", async () => {
+		const h = setup();
+		const hidden = makeSnapshotEntry(pending(), "hidden");
+		const ctx = createMockCtx({ branch: [hidden] });
 		await h.emit("session_start", {}, ctx);
 		await h.write(ctx, { operations: [{ action: "update", id: "1", set: { progress: "Tests passed" } }] });
-		expect(JSON.stringify(await h.context(ctx))).toContain("Tests passed");
+		const updated = getTaskState("test-session");
+		vi.mocked(ctx.sessionManager.getBranch).mockReturnValue([hidden, makeSnapshotEntry(updated, "write")]);
+		const messages = [makeToolResult({ toolName: "TaskWrite", toolCallId: "write" })];
+		expect(await h.context(ctx, messages)).toEqual([view(pending())]);
 		await h.write(ctx, { operations: [{ action: "update", id: "1", set: { status: "completed" } }] });
-		expect(await h.context(ctx)).toEqual([]);
+		vi.mocked(ctx.sessionManager.getBranch).mockReturnValue([
+			hidden,
+			makeSnapshotEntry(updated, "write"),
+			makeSnapshotEntry(getTaskState("test-session"), "finished"),
+		]);
+		expect(await h.context(ctx, messages)).toEqual([view(pending())]);
 	});
-	it("honors the single context setting", async () => {
+	it.each([makeState(), makeState([makeTask("1", { status: "completed" })])])(
+		"returns undefined when the hidden snapshot has no unfinished tasks: %j",
+		async (state) => {
+			const h = setup();
+			const ctx = createMockCtx({ branch: [makeSnapshotEntry(state, "hidden")] });
+			await h.emit("session_start", {}, ctx);
+			expect(await h.emit("context", { messages: [summary, makeUserMessage("Continue")] }, ctx)).toEqual([
+				undefined,
+			]);
+		},
+	);
+	it("returns undefined when there are no snapshots", async () => {
+		const h = setup();
+		const ctx = createMockCtx();
+		await h.emit("session_start", {}, ctx);
+		expect(await h.emit("context", { messages: [makeUserMessage("Continue")] }, ctx)).toEqual([undefined]);
+	});
+	it.each([true, false])("filters a returned old view when hidden unfinished work exists: %s", async (unfinished) => {
+		const h = setup();
+		const state = unfinished ? pending() : makeState();
+		const ctx = createMockCtx({ branch: branch(state) });
+		await h.emit("session_start", {}, ctx);
+		const user = makeUserMessage("Continue");
+		const messages = [summary, user, { ...view(pending()), role: "custom" as const, content: "old view" }];
+		expect(await h.emit("context", { messages }, ctx)).toEqual([
+			{ messages: unfinished ? [summary, view(state), user] : [summary, user] },
+		]);
+	});
+	it("inserts at zero without a compaction summary and uses the hidden snapshot timestamp", async () => {
+		const h = setup();
+		const timestamp = "2026-02-03T04:05:06.000Z";
+		const ctx = createMockCtx({ branch: [{ ...makeSnapshotEntry(pending()), timestamp }] });
+		await h.emit("session_start", {}, ctx);
+		const user = makeUserMessage("Continue");
+		expect(await h.emit("context", { messages: [user] }, ctx)).toEqual([
+			{ messages: [view(pending(), Date.parse(timestamp)), user] },
+		]);
+	});
+	it("propagates a failed session restoration from the context hook", async () => {
+		const h = setup();
+		const ctx = createMockCtx({ branch: [{ ...makeSnapshotEntry(pending()), data: { version: 1 } }] });
+		await expect(h.emit("session_start", {}, ctx)).rejects.toThrow();
+		await expect(h.emit("context", { messages: [makeUserMessage("Continue")] }, ctx)).rejects.toThrow();
+	});
+	it("returns undefined when task context is disabled", async () => {
 		vi.spyOn(config, "loadSettings").mockReturnValue({ ...config.loadSettings(), taskContext: false });
 		const h = setup();
 		const ctx = createMockCtx({ branch: branch(pending()) });
 		await h.emit("session_start", {}, ctx);
-		expect(await h.context(ctx)).toEqual([]);
+		expect(await h.emit("context", { messages: [makeUserMessage("Continue")] }, ctx)).toEqual([undefined]);
 	});
 });
 describe("overlay lifecycle", () => {

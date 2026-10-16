@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { makeState, makeTask } from "../test/helpers/index.js";
-import { buildTaskContext } from "./context.js";
+import { makeSnapshotEntry, makeState, makeTask } from "../test/helpers/index.js";
+import { buildTaskContext, carriedOverTasks, taskContextIndex } from "./context.js";
 import { LIMITS } from "./schema.js";
 
 describe("bounded current-state context", () => {
@@ -46,5 +46,68 @@ describe("bounded current-state context", () => {
 		const rows = text?.split("\n").filter((row) => row.startsWith("{")) ?? [];
 		expect(rows.length).toBeGreaterThan(0);
 		for (const row of rows) expect(JSON.parse(row)).toMatchObject({ truncatedFields: ["description", "progress"] });
+	});
+});
+
+describe("carried-over snapshot selection", () => {
+	it("returns no state for an empty branch or unrelated entries", () => {
+		expect(carriedOverTasks([], new Set())).toBeUndefined();
+		expect(
+			carriedOverTasks([null, { type: "message" }, { type: "custom", customType: "other" }], new Set()),
+		).toBeUndefined();
+	});
+	it("returns no state when the first snapshot is visible", () => {
+		expect(carriedOverTasks([makeSnapshotEntry(makeState(), "visible")], new Set(["visible"]))).toBeUndefined();
+	});
+	it("selects the last hidden snapshot and stops decoding at the first visible snapshot", () => {
+		const state = makeState([makeTask("2")]);
+		const hidden = { ...makeSnapshotEntry(state, "hidden"), timestamp: "2026-02-03T04:05:06.000Z" };
+		const visible = { ...makeSnapshotEntry(makeState(), "visible"), data: { toolCallId: "visible" } };
+		function* branch() {
+			yield makeSnapshotEntry(makeState());
+			yield hidden;
+			yield visible;
+			yield { ...hidden, data: null };
+		}
+		expect(carriedOverTasks(branch(), new Set(["visible"]))).toEqual({
+			state,
+			timestamp: Date.parse(hidden.timestamp),
+		});
+	});
+	it("treats snapshots without a tool call id as hidden", () => {
+		const state = makeState([makeTask("1")]);
+		const entry = makeSnapshotEntry(state);
+		expect(carriedOverTasks([entry], new Set(["visible"]))).toEqual({
+			state,
+			timestamp: Date.parse(entry.timestamp),
+		});
+	});
+	it.each(["invalid", undefined, 123])("uses zero for an invalid timestamp: %s", (timestamp) => {
+		const state = makeState([makeTask("1")]);
+		expect(carriedOverTasks([{ ...makeSnapshotEntry(state), timestamp }], new Set())).toEqual({
+			state,
+			timestamp: 0,
+		});
+	});
+	it("propagates a malformed selected snapshot", () => {
+		const entry = { ...makeSnapshotEntry(makeState()), data: { version: 1 } };
+		expect(() => carriedOverTasks([entry], new Set())).toThrow();
+	});
+});
+
+describe("task context insertion index", () => {
+	it("starts at zero without a compaction summary", () => {
+		expect(taskContextIndex([])).toBe(0);
+		expect(taskContextIndex([{ role: "user" }, { role: "toolResult" }])).toBe(0);
+	});
+	it("inserts immediately after the last compaction summary", () => {
+		expect(
+			taskContextIndex([
+				{ role: "compactionSummary" },
+				{ role: "user" },
+				{ role: "compactionSummary" },
+				{ role: "assistant" },
+			]),
+		).toBe(3);
 	});
 });
