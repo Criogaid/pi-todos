@@ -7,17 +7,18 @@ new contract; test totals are not a measure of coverage equivalence.
 
 ## Executed checks
 
-Local execution uses Node.js 26.11.1 and TypeBox 1.3.27.
+Local execution uses Node.js 26.12.0 and TypeBox 1.3.27.
 
 | Check | Result |
 | --- | --- |
 | Formatter, lint, and TypeScript | Passed |
-| New unit and integration suite on the pinned Pi 0.99.2 dependencies | Passed: 173 tests in 16 files |
-| Selected execution-pipeline suite on installed Pi 1.2.0 | Passed: 9 tests |
+| Unit and integration suite on the pinned Pi 0.99.2 dependencies | Passed: 217 tests in 16 files |
+| Execution-pipeline and codemode sandbox suite on installed Pi 1.3.0 | Passed: 17 tests |
 | Package dry-run | Passed: 23 entries; runtime modules and references included, test files excluded; nothing published |
 
 The installed-host run uses that host's SessionManager, wrapper, nested runner,
-and agent-core execution pipeline. It covers direct and concurrent nested
+AgentSession, codemode QuickJS sandbox, local faux provider, and agent-core
+execution pipeline. It covers direct and concurrent nested
 writes, structured results, raw numeric-ID rejection, removed tool names,
 argument rejection, batch rollback, no-op storage, omitted wrapper diagnostics,
 deletion cleanup, completed-task retention, branching, compaction, and session
@@ -32,6 +33,23 @@ context, foreground/child separation, and terminal sanitization.
 The continuity probe invokes the context hook, completes a non-task tool round
 trip, and invokes it again. Requirements and progress remain present. It verifies
 request-context assembly, not whether a real model follows that information.
+
+Seven sandbox scenarios capture the actual provider-facing message lists and
+verify that each later request retains the entire earlier request as its prefix.
+They cover direct writes, codemode writes with returned or omitted output, a
+script failing after a committed write, nested diagnostics that omit TaskWrite
+after the recorder's call limit, mixed direct/nested writes, and real compaction
+followed by a non-task tool round trip and another nested update.
+
+The compaction scenario also checks that the carried-over requirements and
+progress remain in every request. The wrapper's later result carries new task
+facts without refreshing that historical baseline. These are real host and
+sandbox executions with scripted model responses, not live-provider requests.
+
+Restoring the old exact-ID visibility check makes four sandbox prefix cases
+fail (ordinary nested writes, omitted output, script failure, and truncated
+diagnostics), while the two direct/mixed controls pass. Restoring the fix passes
+all seven scenarios on both selected hosts.
 
 ## Local workflow and input footprint
 
@@ -57,15 +75,15 @@ five fewer provider requests.
 The last row is a repeated-input scenario, not billed tokens. The old one-shot
 resume policy could stop contributing task context after one successful
 response; the new policy deliberately pays recurring input for continuity.
-Tokenization, cache behavior, provider serialization, model compliance, and the
-number of real requests were not measured. No live-provider savings claim is
+Tokenization, live cache behavior, provider-specific serialization, model compliance,
+and the number of live requests were not measured. No live-provider savings claim is
 made. The hard per-request context bound remains documented in
 [the tool reference](tool-schema.md#bounds).
 
 ## Not executed
 
 No live model requests, paid provider evaluation, interactive terminal smoke
-session, package installation into personal Pi settings, push, or publication
-was performed. The implementation is locally verified; these results do not
+session, or package installation into personal Pi settings was performed by
+these checks; nothing was published to a package registry. The results do not
 certify every host, model, or terminal. Release evaluation should measure task
 correctness and actual input/cache usage on the intended provider.

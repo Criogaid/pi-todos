@@ -118,6 +118,43 @@ describe("carried-over task context", () => {
 		const messages = [makeUserMessage("Continue"), makeToolResult({ toolName: "TaskWrite", toolCallId: "write" })];
 		expect(await h.emit("context", { messages }, ctx)).toEqual([undefined]);
 	});
+	it.each([false, true])(
+		"does not inject nested writes while their outer results are visible, including failures: %s",
+		async (isError) => {
+			const h = setup();
+			const first = makeSnapshotEntry(pending(), "wrapper/1");
+			const ctx = createMockCtx({ branch: [first] });
+			await h.emit("session_start", {}, ctx);
+			const messages = [makeToolResult({ toolName: "codemode", toolCallId: "wrapper", isError })];
+			expect(await h.emit("context", { messages }, ctx)).toEqual([undefined]);
+			vi.mocked(ctx.sessionManager.getBranch).mockReturnValue([
+				first,
+				makeSnapshotEntry(makeState([makeTask("1", { progress: "Updated" })]), "next-wrapper/1/2"),
+			]);
+			messages.push(makeToolResult({ toolName: "wrapper", toolCallId: "next-wrapper", isError }));
+			expect(await h.emit("context", { messages }, ctx)).toEqual([undefined]);
+		},
+	);
+	it("keeps the compacted baseline fixed through nested writes and restores them after another compaction", async () => {
+		const h = setup();
+		const hidden = makeSnapshotEntry(pending(), "old-wrapper/1");
+		const ctx = createMockCtx({ branch: [hidden] });
+		await h.emit("session_start", {}, ctx);
+		const messages: ContextEvent["messages"] = [summary, makeUserMessage("Continue")];
+		expect(await h.emit("context", { messages }, ctx)).toEqual([
+			{ messages: [summary, view(pending()), messages[1]] },
+		]);
+		const updated = makeState([makeTask("1", { status: "in_progress", progress: "Nested checkpoint" })]);
+		vi.mocked(ctx.sessionManager.getBranch).mockReturnValue([hidden, makeSnapshotEntry(updated, "wrapper/1")]);
+		messages.push(
+			makeToolResult({ toolName: "codemode", toolCallId: "wrapper", nestedCalls: { calls: [], complete: false } }),
+		);
+		expect(await h.emit("context", { messages }, ctx)).toEqual([
+			{ messages: [summary, view(pending()), ...messages.slice(1)] },
+		]);
+		await h.emit("session_compact", {}, ctx);
+		expect(await h.context(ctx, [summary, makeUserMessage("Continue again")])).toEqual([view(updated)]);
+	});
 	it("inserts the hidden snapshot immediately after the compaction summary and survives a non-task round trip", async () => {
 		const h = setup();
 		const snapshot = makeSnapshotEntry(pending(), "hidden-write");

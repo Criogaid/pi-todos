@@ -19,7 +19,7 @@ that schema together.
 
 | Field | Rule | Default |
 | --- | --- | --- |
-| `taskContext` | Boolean. When the snapshot behind the conversation's starting task state is no longer visible (for example after compaction), add a fixed view of that carried-over unfinished work to provider requests. | `true` |
+| `taskContext` | Boolean. Add a fixed view of unfinished tasks from before the first visible task-writing call, including writes inside a visible wrapper. Rebuild the baseline when history is compacted or rewritten. | `true` |
 | `maxWidgetLines` | Integer of at least 3. Panel content rows including heading and overflow footer; the blank spacer is extra. | `12` |
 | `collapseKey` | Lowercase Pi key specification, or `"off"` to disable the shortcut. | `"ctrl+shift+t"` |
 | `guidance` | Optional overrides keyed only by `TaskRead` and `TaskWrite`. | Built-in guidance |
@@ -59,14 +59,23 @@ are rejected. Guidance changes wording, not schemas or execution rules.
 
 ## Task context
 
-The view is rebuilt at the `context` hook from the session's current state.
+The `context` hook derives the view from the last branch snapshot before the
+first write whose direct or outer tool result remains visible. Nested writes
+belong to their visible wrapper, even if its diagnostic call list is truncated
+or the script failed after writing. Appending new calls does not refresh this
+historical baseline. After compaction hides the wrapper, its latest task snapshot
+can become the new baseline.
+
 In-progress tasks appear first with requirements and progress, followed by
 pending summaries. Metadata and completed tasks are excluded. Quoted text is
 explicitly task data; the user's current instructions take precedence.
+Codemode only sends script output to the model: return or print TaskWrite results
+to retain their summary, or use TaskRead when that information was omitted.
 
 Limits live in [`LIMITS`](../src/schema.ts) and are documented in
 [tool bounds](tool-schema.md#bounds). `truncatedFields` identifies shortened
 requirements or progress; the footer counts omitted tasks and directs the model
-to TaskRead. No response acknowledges the view away. Nothing is persisted or
-injected when no unfinished tasks remain. This policy has a recurring input
-cost; disabling it does not alter task storage or tool results.
+to TaskRead. No response acknowledges the view away. The view is transient; no
+view is injected when the selected historical snapshot has no unfinished tasks.
+This policy has a recurring input cost; disabling it does not alter task storage
+or tool results.

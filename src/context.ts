@@ -1,10 +1,9 @@
 /**
  * A transient view of the task state the visible conversation starts from.
  *
- * Every visible TaskWrite result already carries the current active summary, so the view is
- * only needed when the snapshot that set the starting state is no longer visible, e.g. after
- * compaction. It is derived from that hidden snapshot alone and sits at a fixed position, so
- * consecutive provider requests keep a byte-identical prefix and the prompt cache survives.
+ * Direct task results and visible wrappers mark changes made during the visible conversation.
+ * Only snapshots preceding those calls supply the carried-over view, e.g. after compaction.
+ * Its content and position stay fixed while messages are appended, preserving the shared prefix.
  */
 import { activeTasks, isRecord, openBlockers, type TaskState } from "./model.js";
 import { TASK_READ, TASK_WRITE } from "./names.js";
@@ -17,9 +16,19 @@ export interface CarriedOverTasks {
 	readonly state: TaskState;
 	readonly timestamp: number;
 }
+/** Pi nests call ids as <callerId>/<n>; diagnostic nestedCalls records may be truncated. */
+function hasVisibleResult(toolCallId: string, visibleToolCallIds: ReadonlySet<string>): boolean {
+	let id = toolCallId;
+	while (!visibleToolCallIds.has(id)) {
+		const parent = id.replace(/\/\d+$/, "");
+		if (parent === id) return false;
+		id = parent;
+	}
+	return true;
+}
 /**
- * The latest snapshot recorded before the first one whose TaskWrite result is still visible.
- * Hidden snapshots only change when history is rewritten, so the result is stable across requests.
+ * The last snapshot before a write whose direct or outer tool result is still visible.
+ * The baseline stays fixed while calls are appended, even when a wrapper omits nested output.
  */
 export function carriedOverTasks(
 	branch: Iterable<unknown>,
@@ -29,14 +38,14 @@ export function carriedOverTasks(
 	for (const entry of branch) {
 		if (!isRecord(entry) || entry.type !== "custom" || entry.customType !== TASKS_SNAPSHOT_TYPE) continue;
 		const toolCallId = isRecord(entry.data) ? entry.data.toolCallId : undefined;
-		if (typeof toolCallId === "string" && visibleToolCallIds.has(toolCallId)) break;
+		if (typeof toolCallId === "string" && hasVisibleResult(toolCallId, visibleToolCallIds)) break;
 		hidden = entry;
 	}
 	if (!hidden) return undefined;
 	const timestamp = typeof hidden.timestamp === "string" ? Date.parse(hidden.timestamp) : Number.NaN;
 	return { state: decodeSnapshot(hidden.data), timestamp: Number.isNaN(timestamp) ? 0 : timestamp };
 }
-/** Right after the last compaction summary, or first: before any visible TaskWrite result. */
+/** Right after the last compaction summary, or first: before any visible task-writing call. */
 export function taskContextIndex(messages: readonly { role: string }[]): number {
 	for (let index = messages.length - 1; index >= 0; index--)
 		if (messages[index]?.role === "compactionSummary") return index + 1;

@@ -59,6 +59,31 @@ describe("carried-over snapshot selection", () => {
 	it("returns no state when the first snapshot is visible", () => {
 		expect(carriedOverTasks([makeSnapshotEntry(makeState(), "visible")], new Set(["visible"]))).toBeUndefined();
 	});
+	it.each(["visible/1", "visible/257", "visible/1/2", "visible/1/2/3"])(
+		"treats snapshot %s as part of its visible outer call",
+		(toolCallId) => {
+			const entry = makeSnapshotEntry(makeState([makeTask("1")]), toolCallId);
+			expect(carriedOverTasks([entry], new Set(["visible"]))).toBeUndefined();
+		},
+	);
+	it("matches a full outer id containing slashes", () => {
+		const entry = makeSnapshotEntry(makeState([makeTask("1")]), "provider/call/1/2");
+		expect(carriedOverTasks([entry], new Set(["provider/call/1"]))).toBeUndefined();
+	});
+	it.each(["visible-other/1", "visible2/1", "visible/child", "visible/1-extra"])(
+		"does not match unrelated snapshot %s to a visible call",
+		(toolCallId) => {
+			const state = makeState([makeTask("1")]);
+			expect(carriedOverTasks([makeSnapshotEntry(state, toolCallId)], new Set(["visible"]))?.state).toEqual(state);
+		},
+	);
+	it("keeps only the hidden baseline before a visible wrapper and restores nested writes once it is hidden", () => {
+		const baseline = makeState([makeTask("1", { progress: "Before compaction" })]);
+		const updated = makeState([makeTask("1", { progress: "Inside wrapper" })]);
+		const entries = [makeSnapshotEntry(baseline, "old/1"), makeSnapshotEntry(updated, "visible/1/2")];
+		expect(carriedOverTasks(entries, new Set(["visible"]))?.state).toEqual(baseline);
+		expect(carriedOverTasks(entries, new Set())?.state).toEqual(updated);
+	});
 	it("selects the last hidden snapshot and stops decoding at the first visible snapshot", () => {
 		const state = makeState([makeTask("2")]);
 		const hidden = { ...makeSnapshotEntry(state, "hidden"), timestamp: "2026-02-03T04:05:06.000Z" };

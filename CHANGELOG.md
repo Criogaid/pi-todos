@@ -15,11 +15,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Breaking:** replace resumeContext and taskReminder with taskContext. Configuration rejects unknown fields, removed keys, and malformed values instead of applying fallback defaults.
 - Requirements and latest progress have separate fields. Every write returns final-state feedback, while reads paginate bounded summaries or complete details.
 - Completed tasks stay readable and reopenable; the panel hides completed-only plans. Remove automatic clearing and metadata-based hiding.
-- Replace one-shot resume summaries and periodic reminders with a bounded view of carried-over unfinished tasks, added only while the snapshot behind it is hidden (for example after compaction). The view is fixed in place, so it never breaks the prompt-cache prefix; visible TaskWrite results already carry the current summary.
+- Replace one-shot resume summaries and periodic reminders with a bounded view of carried-over unfinished tasks, added only while the snapshot behind it is hidden (for example after compaction). Its content and position stay fixed while messages are appended; direct task results or wrapper output carry later updates.
 - No-op writes save nothing; a failed batch changes nothing. Nested writes use the same commit path.
 - Remove the older-host MouseRegion fallback. Prewarm UI modules only after a foreground session starts.
 - Add execution-pipeline tests that can target an installed Pi host without changing checkout dependencies.
 - Require Node.js 22.19 or newer.
+
+### Fixed
+
+- Recognize nested task writes as part of their visible outer tool result, preserving request prefixes in new sessions and after compaction. This also covers wrappers that omit output, fail after writing, or have truncated nested-call diagnostics.
 
 ## [0.1.0] - 2026-10-08
 

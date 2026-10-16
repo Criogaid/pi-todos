@@ -210,18 +210,24 @@ instructions take precedence. Do not inject completed history or arbitrary
 metadata into the normal context view.
 
 This view is transient and computed from the latest snapshot recorded before the
-first visible TaskWrite result. It is not another persistent task store and does
-not accumulate in the transcript. A non-task tool call, aborted response, or
-retry cannot acknowledge the view away; the next request derives it again.
-Visible TaskWrite results already carry the current active summary, so no view
-is added while they cover the starting state. No unfinished carried-over tasks
-means no injected task view.
+first write whose direct or outer tool result is visible. Pi nests call IDs as
+`<callerId>/<n>`; follow that ancestry rather than relying on the bounded
+`nestedCalls` diagnostic list. A visible wrapper owns its nested writes even
+when the script omits output or fails after committing. Those writes must not
+refresh the carried-over baseline at the start of the conversation.
+
+The view is not another persistent task store and does not accumulate in the
+transcript. A non-task tool call, aborted response, or retry cannot acknowledge
+the view away. Direct TaskWrite results carry the current active summary; a
+codemode script must return or print that result to expose it. Use TaskRead if
+the wrapper omitted the information. No unfinished carried-over tasks means no
+injected view.
 
 The view sits right after the last compaction summary, or first, and depends only
 on hidden history. Appending a current-state view at the end of each request was
-rejected: the transient tail differs from what the next request contains at the
-same position, so on OpenAI Responses the cached prefix stopped at the first
-task write and every later request in the run paid full input.
+rejected: that transient tail differs from what the next request contains at the
+same position and can prevent cache reuse beyond the shared prefix. Actual
+cache usage and billing require a separate provider evaluation.
 
 Replace the separate one-shot resume tracker and every-ten-turn reminder with
 this policy. Do not retain both policies behind modes. Context supplies current
@@ -229,8 +235,8 @@ facts; concise tool guidance explains how to act on them. There is no generic
 nag to create tasks, no synthetic model request, and no timer stream of reminders.
 
 The trade-off is recurring context input after compaction. Keep the view bounded
-and measure its input/cache-read cost against the baseline. It must never change
-the request prefix between consecutive requests.
+and measure its input/cache-read cost against the baseline. It must never
+rewrite the extension's earlier contribution while new conversation messages are appended.
 The proposal must pass a two-request recovery probe and a long-task cost
 comparison before release. If it fails the cost/continuity target, revisit this
 single policy rather than layering the old reminders back on top.

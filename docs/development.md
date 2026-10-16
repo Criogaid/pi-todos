@@ -13,14 +13,16 @@ npm pack --dry-run --ignore-scripts --json
 git diff --check
 ```
 
-Tests make no model requests. `test/setup.ts` isolates HOME and USERPROFILE,
+Tests make no network model requests. `test/setup.ts` isolates HOME and USERPROFILE,
 removes inherited Pi/XDG configuration locations, and cleans its temporary home.
 Real session tests use their own temporary session directory. Never point
 fixtures at personal configuration or existing sessions.
 
 The default development host is pinned to Pi 0.99.2. The persistence integration
 suite exercises its argument preparation, execution pipeline, nested-call
-recorder, session files, branch navigation, and compaction. To run the same suite
+recorder, session files, branch navigation, and compaction. It also runs real
+AgentSession requests and the codemode QuickJS sandbox with Pi's local faux
+provider, asserting unchanged request prefixes across writes and recovery. To run
 against another installed host, set `PI_TODOS_TEST_HOST_ROOT` to that host's
 package directory (the directory containing its package.json), then run:
 
@@ -30,8 +32,8 @@ npm test -- src/persistence.integration.test.ts
 
 The test resolves that package's SessionManager, wrapper, nested runner, and
 agent execution pipeline. Tool implementation imports and UI fixtures still use
-the checkout's dependencies. This probes the selected execution pipeline; it is
-not a complete interactive UI or live-provider certification. See the
+the checkout's dependencies. This probes the selected execution pipeline and
+codemode sandbox; it is not interactive UI or live-provider certification. See the
 [validation record](validation.md).
 
 ## Local installation
@@ -54,7 +56,7 @@ checks packaging without publishing anything.
 | `src/persistence.ts` | One snapshot format; strict branch restoration, never conversion or fallback. |
 | `src/store.ts` | Session-keyed live state, restoration-failure state, and foreground selection. |
 | `src/tool.ts` | Two tool registrations, persist-before-publish commit, result adaptation, and `/tasks`. |
-| `src/context.ts` | Bounded current-state projection on every context hook. No persistent state. |
+| `src/context.ts` | Bounded carried-over projection before the first visible direct or wrapped task write. No persistent state. |
 | `src/index.ts` | Configuration and lifecycle wiring; UI resource cleanup. |
 | `src/config.ts` | One strict configuration schema and resolved defaults. |
 | `src/format.ts`, `src/sanitize.ts`, `src/overlay.ts` | Terminal presentation of task facts. |

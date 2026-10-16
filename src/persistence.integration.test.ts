@@ -3,7 +3,7 @@ import { findPackageJSON } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import type { JsonObject } from "@earendil-works/pi-ai";
+import type { JsonObject, TranscriptContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The same contract probes can exercise an installed host without changing dependencies.
@@ -17,7 +17,27 @@ const corePackage = findPackageJSON(
 if (!corePackage) throw new Error("Selected host has no pi-agent-core package");
 const hostUrl = (path: string) => pathToFileURL(join(hostRoot, path)).href;
 // These typed boundaries deliberately require the selected host to implement the checked API.
-const { SessionManager }: typeof import("@earendil-works/pi-coding-agent") = await import(hostUrl("dist/index.js"));
+const {
+	createAgentSession,
+	DefaultResourceLoader,
+	ModelRuntime,
+	SessionManager,
+	SettingsManager,
+}: typeof import("@earendil-works/pi-coding-agent") = await import(hostUrl("dist/index.js"));
+const {
+	createCodemodeExtension,
+}: typeof import("../node_modules/@earendil-works/pi-coding-agent/dist/extensions/codemode/index.js") = await import(
+	hostUrl("dist/extensions/codemode/index.js")
+);
+const aiPackage = findPackageJSON("@earendil-works/pi-ai", pathToFileURL(join(resolve(hostRoot), "package.json")));
+if (!aiPackage) throw new Error("Selected host has no pi-ai package");
+const {
+	fauxProvider,
+	fauxAssistantMessage,
+	fauxToolCall,
+}: typeof import("../node_modules/@earendil-works/pi-ai/dist/providers/faux.js") = await import(
+	pathToFileURL(join(dirname(aiPackage), "dist/providers/faux.js")).href
+);
 const {
 	NESTED_CALL_LIMITS,
 	NestedToolCallRunner,
@@ -40,6 +60,7 @@ import {
 	makeToolResult,
 	makeUserMessage,
 } from "../test/helpers/index.js";
+import { buildTaskContext } from "./context.js";
 import registerExtension from "./index.js";
 import { isRecord } from "./model.js";
 import { TASKS_SNAPSHOT_TYPE } from "./persistence.js";
@@ -318,4 +339,155 @@ it("preserves status during progress updates and clears optional fields through 
 	await h.call("TaskWrite", updateArgs("1", { progress: "Checked", owner: null }));
 	expect(h.state().tasks[0]).toMatchObject({ status: "in_progress", progress: "Checked", metadata: { keep: null } });
 	expect(h.state().tasks[0]).not.toHaveProperty("owner");
+});
+
+async function setupCodemode() {
+	const directory = mkdtempSync(join(tmpdir(), "pi-task-codemode-"));
+	directories.push(directory);
+	const faux = fauxProvider({ provider: "task-context-probe" });
+	const modelRuntime = await ModelRuntime.create({
+		authPath: join(directory, "auth.json"),
+		modelsPath: null,
+		refreshOnCreate: false,
+		allowModelNetwork: false,
+	});
+	modelRuntime.registerNativeProvider(faux.provider);
+	const settingsManager = SettingsManager.inMemory({
+		compaction: { enabled: false, keepRecentTokens: 0 },
+		retry: { enabled: false },
+		codemode: { mode: "only" },
+	});
+	const resourceLoader = new DefaultResourceLoader({
+		cwd: directory,
+		agentDir: join(directory, "agent"),
+		settingsManager,
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+		extensionFactories: [registerExtension, createCodemodeExtension({ models: false })],
+	});
+	await resourceLoader.reload();
+	expect(resourceLoader.getExtensions().errors).toEqual([]);
+	const manager = SessionManager.inMemory(directory);
+	const { session } = await createAgentSession({
+		cwd: directory,
+		agentDir: join(directory, "agent"),
+		modelRuntime,
+		model: faux.getModel(),
+		sessionManager: manager,
+		settingsManager,
+		resourceLoader,
+		tools: ["TaskWrite", "TaskRead", "codemode"],
+	});
+	await session.bindExtensions({});
+	const requests: TranscriptContext["messages"][] = [];
+	const record = (response: ReturnType<typeof fauxAssistantMessage>) => (context: TranscriptContext) => {
+		requests.push(structuredClone(context.messages));
+		return response;
+	};
+	return { session, manager, faux, requests, record };
+}
+
+function expectAppendOnlyRequests(requests: readonly TranscriptContext["messages"][]): void {
+	for (let index = 1; index < requests.length; index++) {
+		const previous = requests[index - 1];
+		expect(requests[index]?.slice(0, previous.length)).toEqual(previous);
+	}
+}
+
+describe("task context through the real codemode sandbox", () => {
+	beforeEach(() => vi.useRealTimers());
+	afterEach(() => vi.useFakeTimers());
+	it.each(["direct", "nested", "silent", "failed", "truncated", "direct-then-nested"])(
+		"preserves request prefixes through %s task writes",
+		async (mode) => {
+			const h = await setupCodemode();
+			try {
+				const call = (args: JsonObject, id: string) => {
+					if (mode === "direct" || (mode === "direct-then-nested" && id === "first"))
+						return fauxAssistantMessage([fauxToolCall("TaskWrite", args, { id })], { stopReason: "toolUse" });
+					const reads =
+						mode === "truncated" && id === "first"
+							? `for (let i = 0; i < ${NESTED_CALL_LIMITS.maxCalls}; i++) await tools.TaskRead({});`
+							: "";
+					const write = `const result = await tools.TaskWrite(${JSON.stringify(args)});`;
+					const output =
+						mode === "failed" ? 'throw new Error("After write");' : mode === "silent" ? "" : "text(result);";
+					return fauxAssistantMessage([fauxToolCall("codemode", { code: reads + write + output }, { id })], {
+						stopReason: "toolUse",
+					});
+				};
+				h.faux.setResponses([
+					h.record(call(createArgs("Tracked"), "first")),
+					h.record(call(updateArgs("1", { progress: "Checkpoint" }), "second")),
+					h.record(fauxAssistantMessage("done")),
+				]);
+				await h.session.prompt("Run the prescribed task changes.");
+				expect(h.requests).toHaveLength(3);
+				expect(getTaskState(h.manager.getSessionId()).tasks[0].progress).toBe("Checkpoint");
+				expectAppendOnlyRequests(h.requests);
+				if (mode === "truncated") {
+					const first = h.session.messages.find(
+						(message) => message.role === "toolResult" && message.toolCallId === "first",
+					);
+					expect(first).toMatchObject({ nestedCalls: { complete: false } });
+					if (first?.role !== "toolResult") throw new Error("Missing wrapper result");
+					expect(first.nestedCalls?.calls.some((call) => call.name === "TaskWrite")).toBe(false);
+				}
+			} finally {
+				h.session.dispose();
+			}
+		},
+	);
+	it("restores nested task requirements after real compaction and keeps them through later tool calls", async () => {
+		const h = await setupCodemode();
+		try {
+			h.faux.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("codemode", {
+							code: `text(await tools.TaskWrite(${JSON.stringify({ operations: [{ action: "create", task: { subject: "Continue work", description: "Preserve requirements", status: "in_progress", progress: "Before compaction" } }] })}));`,
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("ready"),
+			]);
+			await h.session.prompt("Create the task.");
+			const baseline = buildTaskContext(getTaskState(h.manager.getSessionId()));
+			if (!baseline) throw new Error("Missing task baseline");
+			h.faux.setResponses([fauxAssistantMessage("Earlier work was compacted.")]);
+			await h.session.compact();
+			h.faux.setResponses([
+				h.record(
+					fauxAssistantMessage([fauxToolCall("codemode", { code: 'text("Unrelated tool round trip");' })], {
+						stopReason: "toolUse",
+					}),
+				),
+				h.record(
+					fauxAssistantMessage(
+						[
+							fauxToolCall("codemode", {
+								code: `text(await tools.TaskWrite(${JSON.stringify(updateArgs("1", { progress: "After compaction" }))}));`,
+							}),
+						],
+						{ stopReason: "toolUse" },
+					),
+				),
+				h.record(fauxAssistantMessage("done")),
+			]);
+			await h.session.prompt("Continue the task.");
+			expect(h.requests).toHaveLength(3);
+			for (const request of h.requests)
+				expect(request).toContainEqual(
+					expect.objectContaining({ role: "user", content: [{ type: "text", text: baseline }] }),
+				);
+			expectAppendOnlyRequests(h.requests);
+			expect(getTaskState(h.manager.getSessionId()).tasks[0].progress).toBe("After compaction");
+		} finally {
+			h.session.dispose();
+		}
+	});
 });

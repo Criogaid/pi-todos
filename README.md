@@ -73,15 +73,20 @@ include a bounded active summary and a next-ready suggestion when available.
 
 ## Continuity and inspection
 
-Every TaskWrite result carries the current active summary, so visible history
-already shows current task state. When `taskContext` is enabled and the snapshot
-that set the conversation's starting state is no longer visible, such as after
-compaction, requests receive a transient, bounded view of that carried-over state
-right after the compaction summary. In-progress tasks include requirements and
-progress; pending tasks use summaries. The view discloses shortened fields and
-omissions. It depends only on hidden history and stays at a fixed position, so
-consecutive requests keep the same prefix and prompt caching is preserved. There
-are no periodic reminders or stored reminder messages.
+Direct TaskWrite results carry the current active summary. For writes inside
+codemode or another wrapper, return or print the write result to retain that
+summary in the conversation; use TaskRead if the wrapper omitted it.
+
+When `taskContext` is enabled, requests receive a bounded view of tasks carried
+over from before the visible conversation, such as after compaction. The view
+uses the last snapshot before the first write whose direct or outer tool result
+is still visible. Pi's nested call IDs identify the owning wrapper even when its
+diagnostic call list is incomplete. The view sits after the last compaction
+summary, or first when there is none, and stays fixed while new messages are
+appended, preserving the shared prefix.
+In-progress tasks include requirements and progress; pending tasks use summaries.
+Shortened fields and omissions are disclosed. There are no periodic reminders or
+stored reminder messages.
 
 Completed tasks remain readable and can be reopened. A completed-only plan hides
 the panel; `/tasks` still shows it. Starting another run never clears tasks.
@@ -118,7 +123,7 @@ string keys; invalid inputs are rejected before any task changes are saved.
 ## Development and requirements
 
 Use Node.js 22.19+ and npm 11+. The development host is pinned to Pi 0.99.2;
-the installed Pi 1.2.0 execution pipeline is also exercised in the
+the installed Pi 1.3.0 execution pipeline and codemode sandbox are also exercised in the
 [validation record](docs/validation.md). There are no older-host fallback paths.
 The panel requires terminal UI; headless sessions retain task functionality.
 Do not load another extension registering the same tool names.
